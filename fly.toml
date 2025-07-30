@@ -1,10 +1,8 @@
 app = "ctrader-order-bot"
+primary_region = "fra"
 
 [build]
   dockerfile = "Dockerfile"
-
-[env]
-  PORT = "3000"
 
 [[services]]
   internal_port = 3000
