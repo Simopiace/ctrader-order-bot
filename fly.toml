@@ -1,8 +1,7 @@
 app = "ctrader-order-bot"
-primary_region = "cdg"
 
 [build]
-  builder = "heroku/buildpacks:20"
+  dockerfile = "Dockerfile"
 
 [env]
   PORT = "3000"
