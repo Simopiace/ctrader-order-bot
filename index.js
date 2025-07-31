@@ -18,7 +18,7 @@ const {
 } = process.env;
 
 if (!CTRADER_CLIENT_ID || !CTRADER_CLIENT_SECRET || !INITIAL_REFRESH || !CTRADER_ACCOUNT_ID) {
-  console.error('❌  Variabili d’ambiente mancanti.');
+  console.error('❌  Variabili d'ambiente mancanti.');
   process.exit(1);
 }
 
@@ -78,6 +78,7 @@ async function refreshToken (delay = 0) {
 /* WEBSOCKET                                                          */
 /* ------------------------------------------------------------------ */
 let ws;
+let heartbeatInterval;
 
 function openSocket () {
   ws = new WebSocket(WS_HOST);
@@ -102,18 +103,57 @@ function openSocket () {
 
     if (msg.payloadType === 2101) {     // APPLICATION_AUTH_RES
       console.log('✔︎ Auth ok – socket pronto');
+      
+      // AVVIA HEARTBEAT ogni 10 secondi
+      startHeartbeat();
       return;
     }
     console.error('❌ Auth failed:', msg.payload?.errorCode, msg.payload?.description);
     ws.close();
   });
 
+  // Gestisci tutti i messaggi successivi (inclusi HEARTBEAT_RES)
+  ws.on('message', buf => {
+    let msg; try { msg = JSON.parse(buf.toString()) } catch { return }
+    
+    // Log solo messaggi non-heartbeat per ridurre spam
+    if (msg.payloadType !== 2111) { // HEARTBEAT_RES
+      console.log('▶︎ WS MSG', msg.payloadType, msg.clientMsgId);
+    }
+  });
+
   ws.on('close', () => {
     console.warn('WS closed – reconnect in 5 s');
+    stopHeartbeat();
     setTimeout(openSocket, 5000);
   });
 
-  ws.on('error', err => console.error('WS error', err.message));
+  ws.on('error', err => {
+    console.error('WS error', err.message);
+    stopHeartbeat();
+  });
+}
+
+function startHeartbeat() {
+  stopHeartbeat(); // pulisci eventuale precedente
+  
+  heartbeatInterval = setInterval(() => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        clientMsgId: 'ping_' + Date.now(),
+        payloadType: 2110, // HEARTBEAT_REQ
+        payload: {}
+      }));
+      console.log('♥ Heartbeat sent');
+    }
+  }, 10000); // ogni 10 secondi
+}
+
+function stopHeartbeat() {
+  if (heartbeatInterval) {
+    clearInterval(heartbeatInterval);
+    heartbeatInterval = null;
+  }
 }
 
 /* ------------------------------------------------------------------ */
