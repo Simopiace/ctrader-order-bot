@@ -1,5 +1,5 @@
 // index.js — cTrader Open API 2.1 bridge (HTTP ⇄ WebSocket)
-// copia / incolla **tutto il file** e rimpiazza quello esistente.
+// incolla tutto questo file al posto di quello esistente.
 
 import express   from 'express';
 import fetch     from 'node-fetch';
@@ -11,7 +11,7 @@ const {
   CTRADER_CLIENT_ID,
   CTRADER_CLIENT_SECRET,
   CTRADER_REFRESH_TOKEN: INITIAL_REFRESH,
-  CTRADER_ACCOUNT_ID,            // numero CTID (int64 → string)
+  CTRADER_ACCOUNT_ID,            // CTID (int64) come stringa
   CTRADER_ENV = 'demo'
 } = process.env;
 
@@ -29,12 +29,12 @@ const WS_HOST =
 let ws;
 let accessToken;
 let refreshToken = INITIAL_REFRESH;
-let socketReady  = false;           // diventa true dopo ACCOUNT-AUTH OK
-const pending    = new Map();       // clientMsgId → {resolve,reject}
+let socketReady  = false;                // true dopo ACCOUNT-AUTH OK
+const pending    = new Map();            // clientMsgId → {resolve,reject}
 
 /* ──────────────── TOKEN ──────────────── */
 
-async function getToken (delay = 0) {
+async function refreshOAuth (delay = 0) {
   if (delay) await new Promise(r => setTimeout(r, delay));
   try {
     const res = await fetch('https://openapi.ctrader.com/apps/token', {
@@ -51,7 +51,7 @@ async function getToken (delay = 0) {
     if (res.status === 429) {
       const wait = 30_000 + Math.random()*30_000;
       console.warn('↻ 429 Too Many Requests — retry in', (wait/1000).toFixed(1), 's');
-      return getToken(wait);
+      return refreshOAuth(wait);
     }
     if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
 
@@ -60,10 +60,10 @@ async function getToken (delay = 0) {
     refreshToken    = j.refresh_token || refreshToken;
     const expiresIn = j.expires_in ?? 900;
     console.log('✔︎  HTTP token ok – expires in', expiresIn, 's');
-    setTimeout(getToken, (expiresIn - 60 + (Math.random()*10 - 5))*1000);
+    setTimeout(refreshOAuth, (expiresIn - 60 + (Math.random()*10 - 5))*1000);
   } catch (e) {
     console.error('⚠︎  token error', e.message);
-    setTimeout(getToken, 60_000 + Math.random()*60_000);
+    setTimeout(refreshOAuth, 60_000 + Math.random()*60_000);
   }
 }
 
@@ -95,18 +95,14 @@ function openSocket () {
       clientId    : CTRADER_CLIENT_ID,
       clientSecret: CTRADER_CLIENT_SECRET
     })
-    .then(() => {
-      console.log('✓  App-auth OK – sending ACCOUNT-AUTH');
-      return sendWS({
-        payloadType        : 2102,        // ProtoOAAccountAuthReq
-        ctidTraderAccountId: CTRADER_ACCOUNT_ID,
-        accessToken
-      });
-    })
+    .then(() => sendWS({
+      payloadType        : 2102,          // ProtoOAAccountAuthReq
+      ctidTraderAccountId: CTRADER_ACCOUNT_ID,
+      accessToken
+    }))
     .then(() => {
       socketReady = true;
       console.log('✓  Account-auth OK — socket ready');
-      // **Niente altri messaggi automatici qui**
     })
     .catch(err => {
       console.error('❌ WS auth error', err.message);
@@ -114,23 +110,36 @@ function openSocket () {
     });
   });
 
-  ws.on('message', buf => {
-    let m; try { m = JSON.parse(buf.toString()) } catch { return; }
-    const { payloadType, clientMsgId } = m;
+  ws.on('message', data => {
+    let msg;
+    try { msg = JSON.parse(data.toString()); } catch { /* non-JSON → ignora */ }
 
+    const { payloadType, clientMsgId } = msg || {};
+
+    /* — risposta attesa — */
     if (clientMsgId && pending.has(clientMsgId)) {
-      pending.get(clientMsgId).resolve(m);
+      pending.get(clientMsgId).resolve(msg);
       pending.delete(clientMsgId);
-    } else if (payloadType === 40) {               // ProtoOAExecutionEvent
-      console.log('▶︎  Execution event', JSON.stringify(m.payload));
-    } else if (payloadType === 39) {               // ProtoOAErrorRes
-      console.warn('⚠︎  WS error', m.payload?.errorCode, m.payload?.description);
+      return;
+    }
+
+    /* — heartbeat — echo immediato — */
+    if (payloadType === 1010) {          // ProtoHeartbeatEvent
+      ws.send(JSON.stringify({ payloadType: 1010 }));
+      return;
+    }
+
+    /* — altri eventi utili — */
+    if (payloadType === 40) {            // ProtoOAExecutionEvent
+      console.log('▶︎  Execution', JSON.stringify(msg.payload));
+    } else if (payloadType === 39) {     // ProtoOAErrorRes
+      console.warn('⚠︎  WS error', msg.payload?.errorCode, msg.payload?.description);
     }
   });
 
-  ws.on('close', () => {
+  ws.on('close', (code, reason) => {
     socketReady = false;
-    console.warn('WS closed – reconnecting in 5 s');
+    console.warn('WS closed', code, reason?.toString(), '– reconnecting in 5 s');
     setTimeout(openSocket, 5_000);
   });
 
@@ -142,7 +151,7 @@ function openSocket () {
 const app = express();
 app.use(express.json());
 
-// POST /order {symbolId, side, volume, type?, limitPrice?, stopPrice?, tp?, sl?, timeInForce?}
+// POST /order  { symbolId, side, volume, type?, limitPrice?, stopPrice?, tp?, sl?, timeInForce? }
 app.post('/order', async (req, res) => {
   if (!socketReady) return res.status(503).json({ error: 'socket not ready' });
 
@@ -159,32 +168,32 @@ app.post('/order', async (req, res) => {
   } = req.body || {};
 
   const msg = {
-    payloadType        : 62,                   // ProtoOANewOrderReq
+    payloadType        : 62,                 // ProtoOANewOrderReq
     ctidTraderAccountId: CTRADER_ACCOUNT_ID,
     symbolId           : Number(symbolId),
     orderType          : type,
     tradeSide          : side,
     volume             : Number(volume),
-    ...(limitPrice  ? { limitPrice }            : {}),
-    ...(stopPrice   ? { stopPrice }             : {}),
-    ...(tp          ? { takeProfit : tp }       : {}),
-    ...(sl          ? { stopLoss   : sl }       : {}),
-    ...(timeInForce ? { timeInForce }           : {})
+    ...(limitPrice  ? { limitPrice }          : {}),
+    ...(stopPrice   ? { stopPrice }           : {}),
+    ...(tp          ? { takeProfit : tp }     : {}),
+    ...(sl          ? { stopLoss   : sl }     : {}),
+    ...(timeInForce ? { timeInForce }         : {})
   };
 
   try {
-    const resp = await sendWS(msg);              // attende ExecutionEvent
+    const resp = await sendWS(msg);            // attende ExecutionEvent
     const exec = resp.payload || {};
     if (exec.errorCode) throw new Error(exec.errorCode);
-    return res.json({ orderId: exec.order?.id, status: exec.executionType });
-  } catch (err) {
-    return res.status(400).json({ error: err.message });
+    res.json({ orderId: exec.order?.id, status: exec.executionType });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
   }
 });
 
 /* ──────────────── BOOT ──────────────── */
 
-await getToken();
+await refreshOAuth();
 openSocket();
 
 const PORT = process.env.PORT || 8080;
