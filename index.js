@@ -79,7 +79,7 @@ function openSocket () {
   ws.on('open', () => {
     console.log('✔︎ WS connected (sending auth)');
     ws.send(JSON.stringify({
-      payloadType: 'PROTOCOL_APPLICATION_AUTH_REQ',
+      payloadType: 'APPLICATION_AUTH_REQ',
       payload: {
         clientId    : CTRADER_CLIENT_ID,
         clientSecret: CTRADER_CLIENT_SECRET,
