@@ -68,6 +68,9 @@ async function refreshToken (delay = 0) {
 /* ------------------------------------------------------------------ */
 /* WEBSOCKET                                                           */
 /* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+/* WEBSOCKET                                                           */
+/* ------------------------------------------------------------------ */
 function openSocket () {
   ws = new WebSocket(WS_HOST);
 
@@ -76,12 +79,14 @@ function openSocket () {
     ws.send(JSON.stringify({
       payloadType: 2100,                 // ApplicationAuthReq
       payload    : {
-        clientId   : CTRADER_CLIENT_ID,
-        accessToken                      // **niente clientSecret!**
+        clientId    : CTRADER_CLIENT_ID,
+        clientSecret: CTRADER_CLIENT_SECRET,   //  ←  rimetto il segreto
+        accessToken
       }
     }));
   });
 
+  // primo messaggio = risposta di login
   ws.once('message', buf => {
     const raw = buf.toString();
     let msg; try { msg = JSON.parse(raw) } catch { msg = {} }
@@ -89,11 +94,10 @@ function openSocket () {
 
     if (msg.payloadType === 2101 && msg.payload?.status === 'OK') {
       console.log('✔︎  Auth OK – streaming ready');
-      // se serve, qui potresti sottoscrivere feed, ecc.
     } else {
-      console.error('❌  Auth failed:', msg.payload?.status, msg.payload?.description||'');
-      // niente exit: riprova tra 30 s
-      setTimeout(openSocket, 30_000);
+      console.error('❌  Auth failed:', msg.payload?.status, msg.payload?.description || '');
+      ws.close();
+      setTimeout(openSocket, 30_000);    // ritenta fra 30 s
     }
   });
 
