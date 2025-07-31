@@ -1,8 +1,8 @@
-// index.js – Bridge HTTP ⇄ WebSocket per cTrader (JSON)
-// v4: payloadType = string, mapping simbolo → id, fix AUTH
+// index.js – bridge HTTP ⇄ cTrader OpenAPI (solo JSON)
+// v5: AUTH_REQ = 2100, gestione errori corretta
 
-import express   from 'express';
-import fetch     from 'node-fetch';
+import express from 'express';
+import fetch   from 'node-fetch';
 import WebSocket from 'ws';
 
 const {
@@ -14,19 +14,18 @@ const {
   PORT = 8080
 } = process.env;
 
-// host WS (porta 5036)
+/* ---------- WS host ---------- */
 const WS_HOST = CTRADER_ENV === 'live'
   ? 'wss://live.ctraderapi.com:5036'
   : 'wss://demo.ctraderapi.com:5036';
 
+/* ---------- globals ---------- */
 let ws;
 let accessToken;
 let refresh = CTRADER_REFRESH_TOKEN;
 
-/* ------------------------------------------------------------------ */
-/* TOKEN                                                              */
-/* ------------------------------------------------------------------ */
-async function refreshToken(delay = 0) {
+/* ---------- token ---------- */
+async function refreshToken (delay = 0) {
   if (delay) await new Promise(r => setTimeout(r, delay));
 
   try {
@@ -43,7 +42,7 @@ async function refreshToken(delay = 0) {
 
     if (r.status === 429) {
       const w = 30_000 + Math.random()*30_000;
-      console.warn('↻ 429 Too Many Requests – retry in', (w/1000).toFixed(1), 's');
+      console.warn('↻ 429 Too Many Requests – retry in', w/1000,'s');
       return refreshToken(w);
     }
     if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
@@ -52,27 +51,24 @@ async function refreshToken(delay = 0) {
     accessToken = j.access_token;
     refresh     = j.refresh_token || refresh;
     const exp   = j.expires_in ?? j.expiresIn ?? 900;
-    console.log('✔︎ Token ok. Expires in', exp, 'sec');
+    console.log('✔︎ Token ok. Expires in', exp,'sec');
 
-    setTimeout(refreshToken, (exp - 60 + (Math.random()*10-5))*1000);
+    setTimeout(refreshToken, (exp-60+(Math.random()*10-5))*1000);
   } catch(e) {
-    console.error('⚠︎ Token refresh error', e.message);
+    console.error('⚠︎ token refresh', e.message);
     setTimeout(refreshToken, 60_000 + Math.random()*60_000);
   }
 }
 
-/* ------------------------------------------------------------------ */
-/* WEBSOCKET                                                          */
-/* ------------------------------------------------------------------ */
-function openSocket() {
+/* ---------- websocket ---------- */
+function openSocket () {
   ws = new WebSocket(WS_HOST);
 
-  ws.on('open', () => {
+  ws.once('open', () => {
     console.log('✔︎ WS connected – sending AUTH');
     ws.send(JSON.stringify({
-      /* ⇣ STRING! */
-      payloadType: 'PROTO_OA_APPLICATION_AUTH_REQ',
-      payload: {
+      payloadType: 2100,                           // <- codice numerico
+      payload    : {
         clientId    : CTRADER_CLIENT_ID,
         clientSecret: CTRADER_CLIENT_SECRET,
         accessToken
@@ -80,15 +76,21 @@ function openSocket() {
     }));
   });
 
-  ws.once('message', buf => {
-    const msg = JSON.parse(buf.toString());
+  ws.once('message', raw => {
+    let msg;
+    try { msg = JSON.parse(raw.toString()) } catch { msg = {} }
+
     console.log('▶︎ WS AUTH RES raw', msg);
 
-    if (msg.payloadType === 'PROTO_OA_ERROR_RES') {
-      console.error('❌ Auth failed:', msg.payload.errorCode, msg.payload.description);
-      process.exit(1);
+    if (msg.payloadType === 2101) {                // ok
+      console.log('✓ Auth ok – socket pronto');
+      return;                                      // lasciamo il WS aperto
     }
-    console.log('✓ Auth ok – socket pronto');
+
+    // se non è 2101 c’è un errore
+    console.error('❌ Auth failed:',
+      msg.payload?.errorCode, msg.payload?.description);
+    process.exit(1);
   });
 
   ws.on('close', () => {
@@ -98,71 +100,48 @@ function openSocket() {
   ws.on('error', e => console.error('WS error', e));
 }
 
-/* ------------------------------------------------------------------ */
-/* EXPRESS API                                                         */
-/* ------------------------------------------------------------------ */
+/* ---------- HTTP API ---------- */
 const app = express();
 app.use(express.json());
 
-/**
- * POST /order
- * body:
- * {
- *   "symbolId": 1,            // obbligatorio
- *   "side": "BUY",            // BUY | SELL
- *   "type": "MARKET",         // MARKET | LIMIT | STOP
- *   "volumeLots": 0.5,        // lotti
- *   "price": 1.1050,          // solo LIMIT/STOP
- *   "tp": 1.11,
- *   "sl": 1.10
- * }
- */
 app.post('/order', (req, res) => {
   if (!ws || ws.readyState !== WebSocket.OPEN)
-    return res.status(503).json({ error: 'socket not ready' });
+    return res.status(503).json({ error:'socket not ready' });
 
   const {
-    symbolId,
-    side: tradeSide,
-    type: orderType = 'MARKET',
-    volumeLots,
-    price, tp, sl
+    symbolId, side:tradeSide, type='MARKET',
+    volumeLots, price, tp, sl
   } = req.body;
 
   if (!symbolId || !tradeSide || !volumeLots)
     return res.status(400).json({ error:'symbolId, side, volumeLots required' });
 
-  const volume = Math.round(volumeLots * 100000); // lotti → centesimi
+  const volume = Math.round(volumeLots*100000);      // 1 lot = 100 k
 
   const payload = {
     ctidTraderAccountId: Number(CTRADER_ACCOUNT_ID),
     clientMsgId        : `order_${Date.now()}`,
     symbolId,
-    orderType,
+    orderType : type,
     tradeSide,
     volume
   };
-
-  if (orderType === 'LIMIT') payload.limitPrice      = price;
-  if (orderType === 'STOP')  payload.stopPrice       = price;
+  if (type==='LIMIT') payload.limitPrice = price;
+  if (type==='STOP')  payload.stopPrice  = price;
   if (tp) payload.takeProfitPrice = tp;
   if (sl) payload.stopLossPrice   = sl;
 
-  const msg = {
-    payloadType: 'PROTO_OA_ORDER_NEW_REQ',
+  ws.send(JSON.stringify({
+    payloadType: 1002,            // PROTO_OA_ORDER_NEW_REQ
     payload
-  };
-
-  console.log('→ NEW_ORDER_REQ', JSON.stringify(payload));
-  ws.send(JSON.stringify(msg), err => {
-    if (err) return res.status(500).json({ error:'ws send error', detail: err.message });
+  }), err => {
+    if (err) return res.status(502).json({ error:'ws send', detail:err.message });
 
     const once = data => {
       const m = JSON.parse(data.toString());
-      if (m.payloadType === 'PROTO_OA_ORDER_NEW_RES'
-       || m.payloadType === 'PROTO_OA_ERROR_RES') {
+      if (m.payloadType === 1003 || m.payloadType === 2142) {   // RES o ERROR
         ws.off('message', once);
-        if (m.payloadType === 'PROTO_OA_ERROR_RES')
+        if (m.payloadType === 2142)
           return res.status(400).json(m.payload);
         return res.json({ orderId: m.payload.orderId });
       }
@@ -171,17 +150,7 @@ app.post('/order', (req, res) => {
   });
 });
 
-/* util: GET /symbols?name=EURUSD */
-app.get('/symbols', async (req, res) => {
-  try {
-    const r = await fetch(`https://api.ctrader.com/v2/symbols?name=${encodeURIComponent(req.query.name||'')}`);
-    res.json((await r.json()).data || []);
-  } catch(e) {
-    res.status(502).json({ error:'symbols fetch', detail:e.message });
-  }
-});
-
-/* ------------------------------------------------------------------ */
+/* ---------- avvio ---------- */
 await refreshToken();
 openSocket();
 app.listen(PORT, () => console.log('bridge ready on', PORT));
