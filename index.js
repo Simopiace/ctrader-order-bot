@@ -1,5 +1,5 @@
 // index.js — ponte HTTP ⇄ WebSocket cTrader
-// Copia e incolla tutto, non modificare altro
+// Incolla tutto: non serve modificare altro
 
 import express from 'express';
 import fetch from 'node-fetch';
@@ -8,9 +8,9 @@ import WebSocket from 'ws';
 const {
   CTRADER_CLIENT_ID,
   CTRADER_CLIENT_SECRET,
-  CTRADER_REFRESH_TOKEN: INITIAL_REFRESH, // <— prende il token solo all’avvio
+  CTRADER_REFRESH_TOKEN: INITIAL_REFRESH,   // token solo al primo avvio
   CTRADER_ACCOUNT_ID,
-  CTRADER_ENV = 'demo'                     // scrivi 'live' se sei su conto reale
+  CTRADER_ENV = 'demo'                      // scrivi 'live' se usi un conto reale
 } = process.env;
 
 const WS_HOST =
@@ -20,38 +20,45 @@ const WS_HOST =
 
 let ws;
 let accessToken;
-let currentRefresh = INITIAL_REFRESH;      // <— diventa variabile “viva”
+let currentRefresh = INITIAL_REFRESH;       // diventa “vivo”
 
-// — Ottiene (e rinnova) un access-token: se Spotware restituisce
-//   anche un refresh_token nuovo, lo salviamo in currentRefresh.
+// ───────────────────────────────────────────────
+// 1. Funzione che ottiene / rinnova l’access-token
+//    • Salva anche il refresh_token nuovo (se c’è)
+//    • Attende 14′ se expires_in è assente
+// ───────────────────────────────────────────────
 async function refreshToken() {
   const res = await fetch('https://openapi.ctrader.com/apps/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
-      grant_type: 'refresh_token',
-      client_id: CTRADER_CLIENT_ID,
+      grant_type:    'refresh_token',
+      client_id:     CTRADER_CLIENT_ID,
       client_secret: CTRADER_CLIENT_SECRET,
-      refresh_token: currentRefresh          // <— usa SEMPRE l’ultimo valido
+      refresh_token: currentRefresh          // sempre l’ultimo valido
     })
   });
 
-  const txt = await res.text();             // leggiamo come testo
-  if (!res.ok) {
+  const txt = await res.text();              // leggiamo come testo
+  if (!res.ok) {                             // se 4xx/5xx → log e uscita
     console.error('Token refresh failed ⇒', res.status, txt.slice(0, 200));
-    process.exit(1);                        // fa riavviare Fly, niente loop infinito
+    process.exit(1);
   }
 
-  const j = JSON.parse(txt);                // ora è JSON sicuro
-  accessToken   = j.access_token;
-  currentRefresh = j.refresh_token || currentRefresh; // <— aggiorna!
-  console.log('✔︎ Token ok. Expires in', j.expires_in, 'sec');
+  const j = JSON.parse(txt);                 // ora è JSON
+  accessToken    = j.access_token;
+  currentRefresh = j.refresh_token || currentRefresh;
 
-  // rinnova 1 min prima della scadenza
-  setTimeout(refreshToken, (j.expires_in - 60) * 1000);
+  // se manca expires_in (alcuni account) usiamo 900 s = 15 min
+  const ttl = Number(j.expires_in) || 900;
+  console.log('✔︎ Token ok. Next refresh in', ttl, 'sec');
+
+  setTimeout(refreshToken, (ttl - 60) * 1000); // rinnova 1 min prima
 }
 
-// — Apre (o riapre) la “chat tecnica” con cTrader
+// ───────────────────────────────────────────────
+// 2. Apre (o riapre) la “chat tecnica” WebSocket
+// ───────────────────────────────────────────────
 function openSocket() {
   ws = new WebSocket(WS_HOST);
 
@@ -61,7 +68,7 @@ function openSocket() {
       JSON.stringify({
         payloadType: 'PROTOCOL_APPLICATION_AUTH_REQ',
         payload: {
-          clientId: CTRADER_CLIENT_ID,
+          clientId:     CTRADER_CLIENT_ID,
           clientSecret: CTRADER_CLIENT_SECRET,
           accessToken
         }
@@ -77,22 +84,25 @@ function openSocket() {
   ws.on('error', err => console.error('WS error', err));
 }
 
-// — Piccola API che Make userà
+// ───────────────────────────────────────────────
+// 3. API HTTP che Make chiamerà: POST /order
+// ───────────────────────────────────────────────
 const app = express();
 app.use(express.json());
 
 app.post('/order', (req, res) => {
   const { symbol, side, volume, price, tp, sl, type = 'LIMIT' } = req.body;
+
   if (!ws || ws.readyState !== 1)
     return res.status(503).json({ error: 'socket not ready' });
 
   const msg = {
     payloadType: 'PROTOCOL_ORDER_NEW_REQ',
     payload: {
-      accountId: Number(CTRADER_ACCOUNT_ID),
-      symbolName: symbol,
-      orderType: type,          // LIMIT / MARKET / STOP
-      tradeSide: side,          // BUY / SELL
+      accountId:   Number(CTRADER_ACCOUNT_ID),
+      symbolName:  symbol,
+      orderType:   type,      // LIMIT / MARKET / STOP
+      tradeSide:   side,      // BUY / SELL
       requestedPrice: price,
       volume,
       takeProfit: tp ? { price: tp } : undefined,
@@ -109,7 +119,7 @@ app.post('/order', (req, res) => {
         m.payloadType === 'PROTOCOL_ORDER_NEW_RESP' ||
         m.payloadType === 'PROTOCOL_ORDER_NEW_REJ'
       ) {
-        ws.off('message', once);            // ascolta una sola risposta
+        ws.off('message', once);             // ascolta solo questa
         if (m.payloadType.endsWith('REJ'))
           return res.status(400).json({ error: m.payload.rejectReason });
         return res.json({ orderId: m.payload.orderId });
@@ -119,7 +129,9 @@ app.post('/order', (req, res) => {
   });
 });
 
-// — Avvio
+// ───────────────────────────────────────────────
+// 4. Avvio
+// ───────────────────────────────────────────────
 await refreshToken();
 openSocket();
 const PORT = process.env.PORT || 8080;
