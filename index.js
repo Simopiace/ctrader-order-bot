@@ -13,11 +13,11 @@ const {
   CTRADER_ENV = 'demo'
 } = process.env;
 
-// ▼ 1) porta giusta (5035) e niente /stream
+// ▼ 1) porta giusta (5036) e niente /stream
 const WS_HOST =
   CTRADER_ENV === 'live'
-    ? 'wss://live.ctraderapi.com:5035'
-    : 'wss://demo.ctraderapi.com:5035';
+    ? 'wss://live.ctraderapi.com:5036'
+    : 'wss://demo.ctraderapi.com:5036';
 
 let ws;
 let accessToken;
