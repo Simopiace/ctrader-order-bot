@@ -25,38 +25,47 @@ let currentRefresh = INITIAL_REFRESH;
 
 // --- token ---
 // — Ottiene (e rinnova) un access-token
-async function refreshToken () {
-  const res = await fetch('https://openapi.ctrader.com/apps/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      grant_type:    'refresh_token',
-      client_id:     CTRADER_CLIENT_ID,
-      client_secret: CTRADER_CLIENT_SECRET,
-      refresh_token: currentRefresh
-    })
-  });
+// — Ottiene (e rinnova) l'access-token con jitter + back-off
+async function refreshToken(delay = 0) {
+  // piccolo ritardo casuale (0-10 s) all'avvio o dopo un 429
+  if (delay) await new Promise(r => setTimeout(r, delay));
 
-  const txt = await res.text();                 // leggiamo come testo
-  if (!res.ok) {                                // 4xx / 5xx ⇒ fermo la VM
-    console.error('Token refresh failed ⇒', res.status, txt.slice(0,200));
-    process.exit(1);
+  try {
+    const res = await fetch('https://openapi.ctrader.com/apps/token', {
+      method : 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body   : new URLSearchParams({
+        grant_type    : 'refresh_token',
+        client_id     : CTRADER_CLIENT_ID,
+        client_secret : CTRADER_CLIENT_SECRET,
+        refresh_token : currentRefresh
+      })
+    });
+
+    if (res.status === 429) {
+      const wait = 30_000 + Math.random() * 30_000;   // 30-60 s
+      console.warn('↻ 429 Too Many Requests — retry in', wait / 1000, 's');
+      return refreshToken(wait);                       // retry con back-off
+    }
+
+    if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+
+    const j = await res.json();
+    accessToken    = j.access_token;
+    currentRefresh = j.refresh_token || currentRefresh;
+
+    console.log('✔︎ Token ok. Expires in', j.expires_in, 'sec');
+
+    // rinnovo 1 min prima della scadenza, con ±5 s di jitter
+    const next = (j.expires_in - 60 + (Math.random() * 10 - 5)) * 1000;
+    setTimeout(refreshToken, next);
+  } catch (err) {
+    console.error('⚠︎ Token refresh error:', err.message);
+    const wait = 60_000 + Math.random() * 60_000;      // 60-120 s
+    setTimeout(() => refreshToken(wait), wait);         // nuovo tentativo
   }
-
-  const j = JSON.parse(txt);
-
-  accessToken    = j.accessToken   ?? j.access_token;
-  currentRefresh = j.refreshToken  ?? j.refresh_token ?? currentRefresh;
-
-  // prende expiresIn (camelCase) o expires_in, altrimenti fallback 900 s
-  const expires = Number(j.expiresIn ?? j.expires_in) || 900;
-
-  console.log('✔︎ Token ok. Next refresh in', expires, 'sec');
-
-  // minimo 5 min tra un refresh e l’altro, altrimenti Spotware → 429
-  const delay = Math.max(expires - 60, 300);
-  setTimeout(refreshToken, delay * 1000);
 }
+
 
 
 // --- websocket ---
