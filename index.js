@@ -1,35 +1,40 @@
 // index.js — bridge HTTP ⇄ WebSocket (cTrader Open API 2.1)
 
+/* ------------------------------------------------------------------ */
+/* DEPENDENZE                                                          */
+/* ------------------------------------------------------------------ */
 import express   from 'express';
 import fetch     from 'node-fetch';
 import WebSocket from 'ws';
 
+/* ------------------------------------------------------------------ */
+/* VARIABILI D’AMBIENTE                                                */
+/* ------------------------------------------------------------------ */
 const {
   CTRADER_CLIENT_ID,
   CTRADER_CLIENT_SECRET,
   CTRADER_REFRESH_TOKEN: INITIAL_REFRESH,
-  CTRADER_ACCOUNT_ID,           // ← CTID account (int64)
+  CTRADER_ACCOUNT_ID,                    // CTID account (int64)
   CTRADER_ENV = 'demo'
 } = process.env;
 
-// demo → :5036  |  live → :5036
 const WS_HOST =
   CTRADER_ENV === 'live'
     ? 'wss://live.ctraderapi.com:5036'
     : 'wss://demo.ctraderapi.com:5036';
 
 /* ------------------------------------------------------------------ */
-/* stato globale                                                      */
+/* STATO GLOBALE                                                       */
 /* ------------------------------------------------------------------ */
-let ws;                        // WebSocket handle
-let accessToken;               // OAuth access token
+let ws;                       // WebSocket
+let accessToken;              // OAuth access-token (HTTP)
 let currentRefresh = INITIAL_REFRESH;
-let socketReady   = false;     // true dopo subscribe OK
-const pending     = new Map(); // clientMsgId → {resolve,reject}
-let hbTimer;                   // heartbeat interval id
+let socketReady   = false;    // diventa true dopo SUBSCRIBE ok
+const pending     = new Map();// clientMsgId → {resolve,reject}
+let hbTimer;                  // heartbeat interval id
 
 /* ------------------------------------------------------------------ */
-/* TOKEN via HTTPS                                                    */
+/* TOKEN VIA HTTPS                                                     */
 /* ------------------------------------------------------------------ */
 async function refreshToken (delay = 0) {
   if (delay) await new Promise(r => setTimeout(r, delay));
@@ -58,7 +63,6 @@ async function refreshToken (delay = 0) {
     currentRefresh = j.refresh_token || currentRefresh;
     const expires  = j.expires_in ?? j.expiresIn ?? 900;
     console.log('✔︎ HTTP token ok – expires in', expires, 's');
-
     setTimeout(refreshToken, (expires - 60 + (Math.random()*10 - 5))*1000);
   } catch (err) {
     console.error('⚠︎ refresh error', err.message);
@@ -67,76 +71,79 @@ async function refreshToken (delay = 0) {
 }
 
 /* ------------------------------------------------------------------ */
-/* WEBSOCKET helpers                                                  */
+/* WEBSOCKET HELPERS                                                   */
 /* ------------------------------------------------------------------ */
 function sendWS (msg) {
-  return new Promise((res, rej) => {
+  return new Promise((resolve, reject) => {
     const id = msg.clientMsgId = msg.clientMsgId || `m_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-    pending.set(id, { resolve: res, reject: rej });
+    pending.set(id, { resolve, reject });
     ws.send(JSON.stringify(msg));
 
-    // safety-timeout (8 s)
+    // timeout di sicurezza (10 s)
     setTimeout(() => {
       if (pending.has(id)) {
+        pending.get(id).reject(new Error('WS response timeout'));
         pending.delete(id);
-        rej(new Error('WS response timeout'));
       }
-    }, 8_000);
+    }, 10_000);
   });
 }
 
 function startHeartbeat () {
   clearInterval(hbTimer);
-  // primo battito subito
-  if (ws && ws.readyState === WebSocket.OPEN)
+  if (ws?.readyState === WebSocket.OPEN)
     ws.send(JSON.stringify({ payloadType: 50 }));       // ProtoOAClientHeartbeatReq
-
   hbTimer = setInterval(() => {
-    if (ws && ws.readyState === WebSocket.OPEN)
+    if (ws?.readyState === WebSocket.OPEN)
       ws.send(JSON.stringify({ payloadType: 50 }));
   }, 7_000);
 }
 
 /* ------------------------------------------------------------------ */
-/* APRE (e riapre) il WebSocket                                       */
+/* APERTURA / RIAPERTURA DEL SOCKET                                   */
 /* ------------------------------------------------------------------ */
 function openSocket () {
   socketReady = false;
   clearInterval(hbTimer);
-
   ws = new WebSocket(WS_HOST);
 
   ws.on('open', () => {
     console.log('✔︎ WS connected – sending APP-AUTH');
-    // 1) Application auth
+
+    // 1) APP-AUTH
     sendWS({
-      payloadType : 2101,                // ProtoOAApplicationAuthReq
+      payloadType : 2101,                 // ProtoOAApplicationAuthReq
       clientId    : CTRADER_CLIENT_ID,
       clientSecret: CTRADER_CLIENT_SECRET
     })
-    // 2) Account auth
+
+    // 2) ACCOUNT-AUTH
     .then(() => {
       console.log('✓ App-auth OK – sending ACCOUNT-AUTH');
       return sendWS({
-        payloadType        : 2102,       // ProtoOAAccountAuthReq
+        payloadType        : 2102,        // ProtoOAAccountAuthReq
         ctidTraderAccountId: Number(CTRADER_ACCOUNT_ID),
         accessToken
       });
     })
-    // 3) Subscribe per tenere vivo il canale
+
+    // 3) SUBSCRIBE (serve il token!)
     .then(() => {
       console.log('✓ Account-auth OK – sending SUBSCRIBE');
       return sendWS({
-        payloadType        : 48,         // ProtoOASubscribeForTradingEventsReq
-        ctidTraderAccountId: Number(CTRADER_ACCOUNT_ID)
+        payloadType        : 48,          // ProtoOASubscribeForTradingEventsReq
+        ctidTraderAccountId: Number(CTRADER_ACCOUNT_ID),
+        accessToken
       });
     })
-    // 4) Pronti
+
+    // 4) PRONTO
     .then(() => {
       socketReady = true;
       console.log('✓ Subscribe OK — socket pronto');
       startHeartbeat();
     })
+
     .catch(err => {
       console.error('❌ WS auth error', err.message);
       ws.close();
@@ -144,16 +151,17 @@ function openSocket () {
   });
 
   ws.on('message', buf => {
-    let m; try { m = JSON.parse(buf.toString()) } catch { /* ignore */ }
+    let m; try { m = JSON.parse(buf.toString()) } catch {/* ignore */}
+    if (!m) return;
 
-    const { payloadType, clientMsgId } = m || {};
+    const { payloadType, clientMsgId } = m;
 
     if (clientMsgId && pending.has(clientMsgId)) {
-      pending.get(clientMsgId).resolve(m);       // risposta attesa
+      pending.get(clientMsgId).resolve(m);
       pending.delete(clientMsgId);
-    } else if (payloadType === 40) {             // ProtoOAExecutionEvent
+    } else if (payloadType === 40) {               // ProtoOAExecutionEvent
       console.log('▶︎ Execution event', JSON.stringify(m.payload));
-    } else if (payloadType === 39) {             // ProtoOAErrorRes
+    } else if (payloadType === 39) {               // ProtoOAErrorRes
       console.warn('⚠︎ WS error', m.payload?.errorCode, m.payload?.description);
     }
   });
@@ -169,21 +177,21 @@ function openSocket () {
 }
 
 /* ------------------------------------------------------------------ */
-/* HTTP mini-API (per Make)                                           */
+/* MINI-API HTTP (per Make.com)                                        */
 /* ------------------------------------------------------------------ */
 const app = express();
 app.use(express.json());
 
-// POST /order { symbolId, side, volume, type, limitPrice?, stopPrice?, tp?, sl? }
+// POST /order  { symbolId, side, volume, type, limitPrice?, stopPrice?, tp?, sl? }
 app.post('/order', async (req, res) => {
   if (!socketReady)
     return res.status(503).json({ error: 'socket not ready' });
 
   const {
-    symbolId,        // INT
-    side,            // "BUY" / "SELL"
-    volume,          // in cent units
-    type = 'MARKET', // MARKET / LIMIT / STOP / …
+    symbolId,
+    side,
+    volume,
+    type = 'MARKET',
     limitPrice,
     stopPrice,
     tp, sl,
@@ -197,16 +205,16 @@ app.post('/order', async (req, res) => {
     orderType          : type,
     tradeSide          : side,
     volume             : Number(volume),
-    ...(limitPrice ? { limitPrice } : {}),
-    ...(stopPrice  ? { stopPrice  } : {}),
-    ...(tp         ? { takeProfit : tp } : {}),
-    ...(sl         ? { stopLoss   : sl } : {}),
+    ...(limitPrice  ? { limitPrice  } : {}),
+    ...(stopPrice   ? { stopPrice   } : {}),
+    ...(tp          ? { takeProfit : tp } : {}),
+    ...(sl          ? { stopLoss   : sl } : {}),
     ...(timeInForce ? { timeInForce } : {})
   };
 
   try {
-    const resp  = await sendWS(msg);          // aspetta ExecutionEvent
-    const exec  = resp.payload || {};
+    const resp = await sendWS(msg);          // aspetta ExecutionEvent
+    const exec = resp.payload || {};
     if (exec.errorCode) throw new Error(exec.errorCode);
 
     return res.json({
@@ -219,11 +227,11 @@ app.post('/order', async (req, res) => {
 });
 
 /* ------------------------------------------------------------------ */
-/* AVVIO                                                               */
+/* BOOT                                                                */
 /* ------------------------------------------------------------------ */
 await refreshToken();   // token HTTP all’avvio
 openSocket();           // handshake WS
 
 const PORT = process.env.PORT || 8080;
-app.get('/', (_q, r) => r.send('cTrader bridge running'));
+app.get('/', (_, r) => r.send('cTrader bridge running'));
 app.listen(PORT, () => console.log('bridge ready on', PORT));
