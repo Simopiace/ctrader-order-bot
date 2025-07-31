@@ -157,7 +157,7 @@ app.post('/order', (req, res) => {
 
   const orderReq = {
     clientMsgId,
-    payloadType : 2120,                       // ORDER_NEW_REQ (JSON)
+    payloadType : 2106,                       // ORDER_NEW_REQ (JSON)
     payload     : {
       ctidTraderAccountId      : Number(CTRADER_ACCOUNT_ID),
       ...(symbolId ? { symbolId: Number(symbolId) } : { symbolName: symbol }),
