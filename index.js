@@ -51,7 +51,6 @@ async function refreshToken (delay = 0) {
       })
     });
 
-    // troppe richieste → attendo 30-60 s e riprovo
     if (res.status === 429) {
       const wait = 30_000 + Math.random()*30_000;
       console.warn('↻ 429 Too Many Requests – retry in', (wait/1000).toFixed(1), 's');
@@ -67,7 +66,6 @@ async function refreshToken (delay = 0) {
     const expires = j.expires_in ?? j.expiresIn ?? 900;
     console.log('✔︎ Token ok. Expires in', expires, 'sec');
 
-    // rinnovo 1 min prima, ±5 s di jitter
     const next = (expires - 60 + (Math.random()*10 - 5)) * 1000;
     setTimeout(refreshToken, next);
   }
@@ -89,7 +87,7 @@ function openSocket () {
   ws.on('open', () => {
     console.log('✔︎ WS connected – sending AUTH');
     const authReq = {
-      clientMsgId : 'auth_'+Date.now(),   // ID univoco che ci tornerà nel RES
+      clientMsgId : 'auth_'+Date.now(),
       payloadType : 2100,                 // APPLICATION_AUTH_REQ
       payload     : {
         clientId    : CTRADER_CLIENT_ID,
@@ -100,17 +98,15 @@ function openSocket () {
     ws.send(JSON.stringify(authReq));
   });
 
-  // primo messaggio = esito autenticazione
   ws.once('message', buf => {
     let msg; try { msg = JSON.parse(buf.toString()) } catch { msg = {} }
     console.log('▶︎ WS AUTH RES raw', msg);
 
     if (msg.payloadType === 2101) {               // APPLICATION_AUTH_RES
       console.log('✔︎ Auth ok – socket pronto');
-      return;                                     // tutto bene
+      return;
     }
 
-    // qualsiasi altra cosa = errore
     const code = msg.payload?.errorCode;
     const desc = msg.payload?.description || '(unknown)';
     console.error('❌ Auth failed:', code, desc);
@@ -126,31 +122,46 @@ function openSocket () {
 }
 
 /* ------------------------------------------------------------------ */
-/* MINI API HTTP (per Make / Zapier …)                                 */
+/* MINI API HTTP (per Make / Zapier …)                                */
 /* ------------------------------------------------------------------ */
 const app = express();
 app.use(express.json());
 
 app.post('/order', (req, res) => {
-  const { symbol, side, volume, price, tp, sl, type='LIMIT' } = req.body;
+  const {
+    symbolId,                // ID numerico del simbolo
+    side,                    // "BUY" | "SELL"
+    volume,                  // in cent-lots (es. 100 000 = 1 lot)
+    price,                   // numero o {limit,stop} per STOP_LIMIT
+    tp, sl,                  // take-profit / stop-loss price
+    type = 'LIMIT'           // "MARKET" | "LIMIT" | "STOP" | "STOP_LIMIT"
+  } = req.body;
 
   if (!ws || ws.readyState !== WebSocket.OPEN)
     return res.status(503).json({ error: 'socket not ready' });
 
   const clientMsgId = 'ord_'+Date.now();
 
+  // mappa prezzi in base al tipo di ordine
+  const priceFields = (
+    type === 'MARKET'      ? {} :
+    type === 'LIMIT'       ? { limitPrice: Number(price) } :
+    type === 'STOP'        ? { stopPrice : Number(price) } :
+    /* STOP_LIMIT */         { limitPrice: Number(price?.limit), stopPrice: Number(price?.stop) }
+  );
+
   const orderReq = {
     clientMsgId,
-    payloadType : 2120,                       // ORDER_NEW_REQ
+    payloadType : 62,                       // ProtoOANewOrderReq
     payload     : {
-      accountId     : Number(CTRADER_ACCOUNT_ID),
-      symbolName    : symbol,
-      orderType     : type,                   // LIMIT / MARKET / STOP
-      tradeSide     : side,                   // BUY / SELL
-      requestedPrice: price,
-      volume,
-      takeProfit    : tp ? { price: tp } : undefined,
-      stopLoss      : sl ? { price: sl } : undefined
+      ctidTraderAccountId: Number(CTRADER_ACCOUNT_ID),
+      symbolId          : Number(symbolId),
+      orderType         : type,             // enum string
+      tradeSide         : side,
+      volume            : Number(volume),
+      ...priceFields,
+      ...(tp && { takeProfit: { price: Number(tp) } }),
+      ...(sl && { stopLoss  : { price: Number(sl) } })
     }
   };
 
@@ -158,18 +169,17 @@ app.post('/order', (req, res) => {
     if (err) return res.status(500).json({ error: 'ws send error' });
 
     const once = data => {
-      const m = JSON.parse(data.toString());
-      if (m.clientMsgId !== clientMsgId) return;   // non è la nostra risposta
+      let m; try { m = JSON.parse(data.toString()) } catch { m = {} }
+      if (m.clientMsgId !== clientMsgId) return;   // risposta di un altro messaggio
 
       ws.off('message', once);
 
-      if (m.payloadType === 2121)                 // ORDER_NEW_RES
-        return res.json({ orderId: m.payload.orderId });
+      if (m.payloadType === 63)                   // ProtoOANewOrderRes
+        return res.json({ orderId: m.payload?.orderId });
 
-      if (m.payloadType === 2142)                 // generic REJ
-        return res.status(400).json({ error: m.payload.description });
+      if (m.payloadType === 39)                   // ProtoOAErrorRes
+        return res.status(400).json({ error: m.payload?.description });
 
-      // caso imprevisto
       res.status(500).json({ error: 'unexpected reply', raw: m });
     };
     ws.on('message', once);
@@ -177,11 +187,10 @@ app.post('/order', (req, res) => {
 });
 
 /* ------------------------------------------------------------------ */
-/* AVVIO                                                               */
+/* AVVIO                                                              */
 /* ------------------------------------------------------------------ */
 await refreshToken();      // ottiene il primo access-token
 openSocket();              // apre (e riapre) il WS
 
 app.get('/', (_q,res)=>res.send('cTrader bridge running'));
 app.listen(PORT, () => console.log('bridge ready on', PORT));
-
