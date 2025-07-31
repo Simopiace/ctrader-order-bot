@@ -12,7 +12,6 @@ const {
   CTRADER_CLIENT_ID,
   CTRADER_CLIENT_SECRET,
   CTRADER_REFRESH_TOKEN: INITIAL_REFRESH,
-  CTRADER_ACCESS_TOKEN: INITIAL_ACCESS,
   CTRADER_ACCOUNT_ID,
   CTRADER_ENV = 'demo',   // 'demo' | 'live'
   PORT         = 8080
@@ -24,16 +23,13 @@ console.log('PORT:', PORT);
 console.log('Has CLIENT_ID:', !!CTRADER_CLIENT_ID);
 console.log('Has CLIENT_SECRET:', !!CTRADER_CLIENT_SECRET);
 console.log('Has REFRESH_TOKEN:', !!INITIAL_REFRESH);
-console.log('Has ACCESS_TOKEN:', !!INITIAL_ACCESS);
 console.log('Has ACCOUNT_ID:', !!CTRADER_ACCOUNT_ID);
 
-if (!CTRADER_CLIENT_ID || !CTRADER_CLIENT_SECRET || (!INITIAL_REFRESH && !INITIAL_ACCESS) || !CTRADER_ACCOUNT_ID) {
+if (!CTRADER_CLIENT_ID || !CTRADER_CLIENT_SECRET || !INITIAL_REFRESH) {
   console.error('❌ Variabili d\'ambiente mancanti:');
   console.error('CTRADER_CLIENT_ID:', !!CTRADER_CLIENT_ID);
   console.error('CTRADER_CLIENT_SECRET:', !!CTRADER_CLIENT_SECRET);
   console.error('CTRADER_REFRESH_TOKEN:', !!INITIAL_REFRESH);
-  console.error('CTRADER_ACCESS_TOKEN:', !!INITIAL_ACCESS);
-  console.error('CTRADER_ACCOUNT_ID:', !!CTRADER_ACCOUNT_ID);
   process.exit(1);
 }
 
@@ -50,7 +46,7 @@ console.log('WS_HOST:', WS_HOST);
 /* ------------------------------------------------------------------ */
 /* TOKEN (OAuth2)                                                     */
 /* ------------------------------------------------------------------ */
-let accessToken = INITIAL_ACCESS; // Inizializza con access token se disponibile
+let accessToken;
 let currentRefresh = INITIAL_REFRESH;
 
 async function refreshToken(delay = 0) {
@@ -85,7 +81,7 @@ async function refreshToken(delay = 0) {
     }
 
     const j = await res.json();
-    console.log('Token response:', JSON.stringify(j, null, 2));
+    console.log('Token response fields:', Object.keys(j));
     
     if (!j.access_token) {
       throw new Error('No access_token in response: ' + JSON.stringify(j));
@@ -96,7 +92,6 @@ async function refreshToken(delay = 0) {
 
     const ttl = j.expires_in ?? j.expiresIn ?? 900;
     console.log('✔︎ Token refreshed successfully – expires in', ttl, 's');
-    console.log('Access token set:', !!accessToken);
 
     // Schedule next refresh
     setTimeout(refreshToken, (ttl - 60 + (Math.random()*10 - 5))*1000);
@@ -117,43 +112,6 @@ async function refreshToken(delay = 0) {
 /* ------------------------------------------------------------------ */
 let ws;
 let heartbeatInterval;
-function authenticateAccount(accountId) {
-  console.log(`🔐 Authenticating account: ${accountId}`);
-  
-  ws.send(JSON.stringify({
-    clientMsgId : 'account_auth_'+Date.now(),
-    payloadType : 2102,              // ACCOUNT_AUTH_REQ
-    payload     : {
-      ctidTraderAccountId: Number(accountId),
-      accessToken
-    }
-  }));
-  
-  // Aspettiamo la risposta dell'account auth
-  ws.once('message', buf => {
-    let accountMsg;
-    try { 
-      accountMsg = JSON.parse(buf.toString()) 
-    } catch (e) { 
-      console.error('❌ Failed to parse ACCOUNT AUTH response:', e.message);
-      ws.close();
-      return;
-    }
-    
-    console.log('▶︎ WS ACCOUNT AUTH RES', accountMsg);
-    
-    if (accountMsg.payloadType === 2103) {     // ACCOUNT_AUTH_RES
-      console.log('✔︎ Account Auth ok – socket fully ready');
-      isAuthenticated = true;
-      currentAccountId = Number(accountId); // Salviamo l'ID corretto
-      startHeartbeat();
-    } else {
-      console.error('❌ Account Auth failed:', accountMsg.payload?.errorCode, accountMsg.payload?.description);
-      ws.close();
-    }
-  });
-}
-
 let isAuthenticated = false;
 let currentAccountId = null;
 
@@ -197,7 +155,7 @@ function openSocket() {
     if (msg.payloadType === 2101) {     // APPLICATION_AUTH_RES
       console.log('✔︎ App Auth ok – requesting account list...');
       
-      // Richiediamo la lista degli account tramite API
+      // Richiediamo la lista degli account
       ws.send(JSON.stringify({
         clientMsgId : 'get_accounts_'+Date.now(),
         payloadType : 2149,              // TRADER_REQ
@@ -287,6 +245,43 @@ function openSocket() {
   });
 }
 
+function authenticateAccount(accountId) {
+  console.log(`🔐 Authenticating account: ${accountId}`);
+  
+  ws.send(JSON.stringify({
+    clientMsgId : 'account_auth_'+Date.now(),
+    payloadType : 2102,              // ACCOUNT_AUTH_REQ
+    payload     : {
+      ctidTraderAccountId: Number(accountId),
+      accessToken
+    }
+  }));
+  
+  // Aspettiamo la risposta dell'account auth
+  ws.once('message', buf => {
+    let accountMsg;
+    try { 
+      accountMsg = JSON.parse(buf.toString()) 
+    } catch (e) { 
+      console.error('❌ Failed to parse ACCOUNT AUTH response:', e.message);
+      ws.close();
+      return;
+    }
+    
+    console.log('▶︎ WS ACCOUNT AUTH RES', accountMsg);
+    
+    if (accountMsg.payloadType === 2103) {     // ACCOUNT_AUTH_RES
+      console.log('✔︎ Account Auth ok – socket fully ready');
+      isAuthenticated = true;
+      currentAccountId = Number(accountId);
+      startHeartbeat();
+    } else {
+      console.error('❌ Account Auth failed:', accountMsg.payload?.errorCode, accountMsg.payload?.description);
+      ws.close();
+    }
+  });
+}
+
 function startHeartbeat() {
   stopHeartbeat(); // pulisci eventuale precedente
   
@@ -295,7 +290,7 @@ function startHeartbeat() {
     if (ws && ws.readyState === WebSocket.OPEN && isAuthenticated) {
       ws.send(JSON.stringify({
         clientMsgId: 'ping_' + Date.now(),
-        payloadType: 51, // HEARTBEAT_EVENT (non 2110!)
+        payloadType: 51, // HEARTBEAT_EVENT
         payload: {}
       }));
       // console.log('♥ Heartbeat sent'); // Uncomment for debugging
@@ -323,6 +318,7 @@ app.get('/', (req, res) => {
     status: 'running',
     websocket: ws ? (ws.readyState === WebSocket.OPEN ? 'connected' : 'disconnected') : 'not_initialized',
     authenticated: isAuthenticated,
+    accountId: currentAccountId,
     timestamp: new Date().toISOString()
   };
   res.json(status);
@@ -335,6 +331,7 @@ app.get('/status', (req, res) => {
     websocket_state: ws ? ws.readyState : 'none',
     authenticated: isAuthenticated,
     has_token: !!accessToken,
+    account_id: currentAccountId,
     environment: CTRADER_ENV
   };
   res.json(status);
@@ -344,12 +341,12 @@ app.get('/status', (req, res) => {
    POST /order
    {
      "symbolId": 1          // OPPURE "symbol": "EURUSD"
-     "side": "BUY(1)"|"SELL(2)",
+     "side": "1"|"2",       // BUY=1, SELL=2
      "volume": 100000,      // cent-units (100 000 = 1 lot standard)
      "price": 1.23456,      // richiesto per LIMIT / STOP
      "tp": 1.24000,         // opzionale
      "sl": 1.23000,         // opzionale
-     "type": "1"|"2"|"3" (default 1)
+     "type": "1"|"2"|"3"    // MARKET=1, LIMIT=2, STOP=3 (default 1)
    }
 */
 app.post('/order', (req, res) => {
@@ -370,12 +367,14 @@ app.post('/order', (req, res) => {
     console.error('❌ Socket not ready:', {
       ws_exists: !!ws,
       ws_state: ws ? ws.readyState : 'none',
-      authenticated: isAuthenticated
+      authenticated: isAuthenticated,
+      account_id: currentAccountId
     });
     return res.status(503).json({ 
       error: 'socket not ready',
       ws_state: ws ? ws.readyState : 'none',
-      authenticated: isAuthenticated
+      authenticated: isAuthenticated,
+      account_id: currentAccountId
     });
   }
 
@@ -389,9 +388,9 @@ app.post('/order', (req, res) => {
 
   const orderReq = {
     clientMsgId,
-    payloadType : 2106,                       // NEW_ORDER_REQ (JSON)
+    payloadType : 2106,                       // NEW_ORDER_REQ
     payload     : {
-      ctidTraderAccountId      : Number(CTRADER_ACCOUNT_ID),
+      ctidTraderAccountId      : currentAccountId,
       ...(symbolId ? { symbolId: Number(symbolId) } : { symbolName: symbol }),
       orderType      : Number(type),            // MARKET | LIMIT | STOP
       tradeSide      : Number(side),            // BUY   | SELL
@@ -403,6 +402,7 @@ app.post('/order', (req, res) => {
   };
 
   console.log('📤 Sending order request:', clientMsgId);
+  console.log('Order payload:', JSON.stringify(orderReq, null, 2));
 
   ws.send(JSON.stringify(orderReq), err => {
     if (err) {
@@ -486,18 +486,10 @@ process.on('SIGINT', () => {
 /* ------------------------------------------------------------------ */
 async function start() {
   try {
-    // Se abbiamo già un access token, proviamo a usarlo direttamente
-    if (accessToken) {
-      console.log('✔︎ Using existing access token');
-    } else if (currentRefresh) {
-      console.log('🔄 Initializing token...');
-      await refreshToken();   // primo access-token
-    } else {
-      throw new Error('No access token or refresh token available');
-    }
+    console.log('🔄 Initializing token...');
+    await refreshToken();   // primo access-token
     
     console.log('🔌 Opening WebSocket...');
-    console.log('Access token available:', !!accessToken);
     openSocket();           // WS con reconnessione
     
     console.log('🌐 Starting HTTP server...');
