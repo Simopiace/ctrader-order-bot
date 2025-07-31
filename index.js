@@ -14,7 +14,7 @@ const {
   CTRADER_CLIENT_ID,
   CTRADER_CLIENT_SECRET,
   CTRADER_REFRESH_TOKEN: INITIAL_REFRESH,
-  CTRADER_ACCOUNT_ID,                    // CTID account (int64)
+  CTRADER_ACCOUNT_ID,
   CTRADER_ENV = 'demo'
 } = process.env;
 
@@ -24,17 +24,17 @@ const WS_HOST =
     : 'wss://demo.ctraderapi.com:5036';
 
 /* ------------------------------------------------------------------ */
-/* STATO GLOBALE                                                       */
+/* STATO                                                               */
 /* ------------------------------------------------------------------ */
-let ws;                       // WebSocket
-let accessToken;              // OAuth access-token (HTTP)
+let ws;
+let accessToken;
 let currentRefresh = INITIAL_REFRESH;
-let socketReady   = false;    // diventa true dopo SUBSCRIBE ok
-const pending     = new Map();// clientMsgId → {resolve,reject}
-let hbTimer;                  // heartbeat interval id
+let socketReady   = false;
+const pending     = new Map();          // clientMsgId → promise handlers
+let hbTimer;
 
 /* ------------------------------------------------------------------ */
-/* TOKEN VIA HTTPS                                                     */
+/* TOKEN HTTP                                                          */
 /* ------------------------------------------------------------------ */
 async function refreshToken (delay = 0) {
   if (delay) await new Promise(r => setTimeout(r, delay));
@@ -61,7 +61,7 @@ async function refreshToken (delay = 0) {
     const j = await res.json();
     accessToken    = j.access_token;
     currentRefresh = j.refresh_token || currentRefresh;
-    const expires  = j.expires_in ?? j.expiresIn ?? 900;
+    const expires  = j.expires_in ?? 900;
     console.log('✔︎ HTTP token ok – expires in', expires, 's');
     setTimeout(refreshToken, (expires - 60 + (Math.random()*10 - 5))*1000);
   } catch (err) {
@@ -71,7 +71,7 @@ async function refreshToken (delay = 0) {
 }
 
 /* ------------------------------------------------------------------ */
-/* WEBSOCKET HELPERS                                                   */
+/* WEBSOCKET UTILS                                                     */
 /* ------------------------------------------------------------------ */
 function sendWS (msg) {
   return new Promise((resolve, reject) => {
@@ -79,7 +79,6 @@ function sendWS (msg) {
     pending.set(id, { resolve, reject });
     ws.send(JSON.stringify(msg));
 
-    // timeout di sicurezza (10 s)
     setTimeout(() => {
       if (pending.has(id)) {
         pending.get(id).reject(new Error('WS response timeout'));
@@ -91,16 +90,14 @@ function sendWS (msg) {
 
 function startHeartbeat () {
   clearInterval(hbTimer);
-  if (ws?.readyState === WebSocket.OPEN)
-    ws.send(JSON.stringify({ payloadType: 50 }));       // ProtoOAClientHeartbeatReq
   hbTimer = setInterval(() => {
     if (ws?.readyState === WebSocket.OPEN)
-      ws.send(JSON.stringify({ payloadType: 50 }));
+      ws.send(JSON.stringify({ payloadType: 50 })); // ProtoOAPingReq
   }, 7_000);
 }
 
 /* ------------------------------------------------------------------ */
-/* APERTURA / RIAPERTURA DEL SOCKET                                   */
+/* APERTURA SOCKET                                                     */
 /* ------------------------------------------------------------------ */
 function openSocket () {
   socketReady = false;
@@ -110,40 +107,32 @@ function openSocket () {
   ws.on('open', () => {
     console.log('✔︎ WS connected – sending APP-AUTH');
 
-    // 1) APP-AUTH
     sendWS({
-      payloadType : 2101,                 // ProtoOAApplicationAuthReq
+      payloadType : 2101,               // ProtoOAApplicationAuthReq
       clientId    : CTRADER_CLIENT_ID,
       clientSecret: CTRADER_CLIENT_SECRET
     })
-
-    // 2) ACCOUNT-AUTH
     .then(() => {
       console.log('✓ App-auth OK – sending ACCOUNT-AUTH');
       return sendWS({
-        payloadType        : 2102,        // ProtoOAAccountAuthReq
+        payloadType        : 2102,      // ProtoOAAccountAuthReq
         ctidTraderAccountId: Number(CTRADER_ACCOUNT_ID),
         accessToken
       });
     })
-
-    // 3) SUBSCRIBE (serve il token!)
     .then(() => {
       console.log('✓ Account-auth OK – sending SUBSCRIBE');
+      // N.B. accessToken NON va più incluso (campo deprecato)
       return sendWS({
-        payloadType        : 48,          // ProtoOASubscribeForTradingEventsReq
-        ctidTraderAccountId: Number(CTRADER_ACCOUNT_ID),
-        accessToken
+        payloadType        : 48,        // ProtoOASubscribeForTradingEventsReq
+        ctidTraderAccountId: Number(CTRADER_ACCOUNT_ID)
       });
     })
-
-    // 4) PRONTO
     .then(() => {
       socketReady = true;
       console.log('✓ Subscribe OK — socket pronto');
       startHeartbeat();
     })
-
     .catch(err => {
       console.error('❌ WS auth error', err.message);
       ws.close();
@@ -151,18 +140,30 @@ function openSocket () {
   });
 
   ws.on('message', buf => {
-    let m; try { m = JSON.parse(buf.toString()) } catch {/* ignore */}
-    if (!m) return;
-
+    let m; try { m = JSON.parse(buf.toString()) } catch { return; }
     const { payloadType, clientMsgId } = m;
 
+    // risposta attesa
     if (clientMsgId && pending.has(clientMsgId)) {
       pending.get(clientMsgId).resolve(m);
       pending.delete(clientMsgId);
-    } else if (payloadType === 40) {               // ProtoOAExecutionEvent
-      console.log('▶︎ Execution event', JSON.stringify(m.payload));
-    } else if (payloadType === 39) {               // ProtoOAErrorRes
-      console.warn('⚠︎ WS error', m.payload?.errorCode, m.payload?.description);
+      return;
+    }
+
+    // ping/pong
+    if (payloadType === 50) {                 // server Ping → client Pong
+      ws.send(JSON.stringify({ payloadType: 51 }));
+      return;
+    }
+    if (payloadType === 51) return;           // Pong res – ignora
+
+    // eventi trading
+    if (payloadType === 40)                   // ProtoOAExecutionEvent
+      return console.log('▶︎ Execution event', JSON.stringify(m.payload));
+
+    if (payloadType === 39) {                 // ProtoOAErrorRes
+      const { errorCode, description } = m.payload || {};
+      return console.warn('⚠︎ WS error', errorCode, description);
     }
   });
 
@@ -177,12 +178,11 @@ function openSocket () {
 }
 
 /* ------------------------------------------------------------------ */
-/* MINI-API HTTP (per Make.com)                                        */
+/* MINI-API HTTP (Make.com)                                            */
 /* ------------------------------------------------------------------ */
 const app = express();
 app.use(express.json());
 
-// POST /order  { symbolId, side, volume, type, limitPrice?, stopPrice?, tp?, sl? }
 app.post('/order', async (req, res) => {
   if (!socketReady)
     return res.status(503).json({ error: 'socket not ready' });
@@ -199,7 +199,7 @@ app.post('/order', async (req, res) => {
   } = req.body || {};
 
   const msg = {
-    payloadType        : 62,                 // ProtoOANewOrderReq
+    payloadType        : 62,                    // ProtoOANewOrderReq
     ctidTraderAccountId: Number(CTRADER_ACCOUNT_ID),
     symbolId           : Number(symbolId),
     orderType          : type,
@@ -213,7 +213,7 @@ app.post('/order', async (req, res) => {
   };
 
   try {
-    const resp = await sendWS(msg);          // aspetta ExecutionEvent
+    const resp = await sendWS(msg);            // aspetta ExecutionEvent
     const exec = resp.payload || {};
     if (exec.errorCode) throw new Error(exec.errorCode);
 
@@ -229,8 +229,8 @@ app.post('/order', async (req, res) => {
 /* ------------------------------------------------------------------ */
 /* BOOT                                                                */
 /* ------------------------------------------------------------------ */
-await refreshToken();   // token HTTP all’avvio
-openSocket();           // handshake WS
+await refreshToken();
+openSocket();
 
 const PORT = process.env.PORT || 8080;
 app.get('/', (_, r) => r.send('cTrader bridge running'));
