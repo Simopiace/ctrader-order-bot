@@ -97,6 +97,8 @@ async function refreshToken(delay = 0) {
     const maxTimeout = 24 * 60 * 60 * 1000; // 24 ore in ms
     const refreshTime = Math.min((ttl - 60) * 1000, maxTimeout);
     
+    console.log(`Next refresh in ${refreshTime/1000/60} minutes`);
+    
     // Schedule next refresh
     setTimeout(refreshToken, refreshTime);
     
