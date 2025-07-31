@@ -164,7 +164,7 @@ app.post('/order', (req, res) => {
       orderType      : type,                  // MARKET | LIMIT | STOP
       tradeSide      : side,                  // BUY   | SELL
       volume         : Number(volume),
-      ...(type !== 'MARKET' ? { requestedPrice: Number(price) } : {}),
+      ...(type !== '1' ? { requestedPrice: Number(price) } : {}),
       ...(tp !== undefined ? { takeProfit: { price: Number(tp) } } : {}),
       ...(sl !== undefined ? { stopLoss  : { price: Number(sl) } } : {})
     }
