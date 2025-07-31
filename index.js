@@ -1,6 +1,5 @@
-// index.js — HTTP ⇄ WebSocket bridge per cTrader Open API 2.1
-// versione “stabile”: ping heartbeat, reconnect esponenziale, promesse safe.
-// Incolla l’intero file e ridisponi → dovrebbe restare connesso.
+// index.js — bridge HTTP ⇄ WebSocket (cTrader Open API 2.1)
+// versione “minimal-stable”: niente messaggi superflui dopo l’handshake.
 
 import express   from 'express';
 import fetch     from 'node-fetch';
@@ -8,12 +7,11 @@ import WebSocket from 'ws';
 
 /* ------------------------------------------------------------------ */
 /* ENV                                                                 */
-/* ------------------------------------------------------------------ */
 const {
   CTRADER_CLIENT_ID,
   CTRADER_CLIENT_SECRET,
   CTRADER_REFRESH_TOKEN: INITIAL_REFRESH,
-  CTRADER_ACCOUNT_ID,                // CTID account (int64)
+  CTRADER_ACCOUNT_ID,              // CTID account (int64)
   CTRADER_ENV = 'demo'
 } = process.env;
 
@@ -24,18 +22,15 @@ const WS_HOST =
 
 /* ------------------------------------------------------------------ */
 /* STATE                                                               */
-/* ------------------------------------------------------------------ */
-let ws;                               // WebSocket handle
-let pingTimer;                        // heartbeat
-let reconnectDelay = 5_000;           // back-off (ms)
+let ws;
+let pingTimer;
 let accessToken;
 let currentRefresh = INITIAL_REFRESH;
-let socketReady = false;              // dopo Account-Auth OK
-const pending = new Map();            // clientMsgId → {resolve,reject,timeoutId}
+let socketReady = false;
+const pending = new Map();         // id → {resolve,reject,timeout}
 
 /* ------------------------------------------------------------------ */
-/* TOKEN (HTTPS)                                                       */
-/* ------------------------------------------------------------------ */
+/* TOKEN                                                               */
 async function refreshToken (delay = 0) {
   if (delay) await new Promise(r => setTimeout(r, delay));
   try {
@@ -71,8 +66,7 @@ async function refreshToken (delay = 0) {
 }
 
 /* ------------------------------------------------------------------ */
-/* WEBSOCKET helpers                                                   */
-/* ------------------------------------------------------------------ */
+/* WS utils                                                            */
 function sendWS (msg, timeout = 10_000) {
   return new Promise((resolve, reject) => {
     const id = msg.clientMsgId = msg.clientMsgId || `m_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
@@ -80,56 +74,44 @@ function sendWS (msg, timeout = 10_000) {
       pending.delete(id);
       reject(new Error('WS response timeout'));
     }, timeout);
-    pending.set(id, {resolve, reject, timeoutId: to});
+    pending.set(id, {resolve, reject, timeout});
     ws.send(JSON.stringify(msg));
   });
 }
 
 function startPing () {
   clearInterval(pingTimer);
-  // ProtoOAPingReq = 50   – solo il payloadType è obbligatorio
   pingTimer = setInterval(() => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ payloadType: 50 }));
-    }
+    if (ws.readyState === WebSocket.OPEN)
+      ws.send(JSON.stringify({ payloadType: 50 }));   // ProtoOAPingReq
   }, 10_000);
 }
 
-function stopPing () { clearInterval(pingTimer); }
-
 /* ------------------------------------------------------------------ */
 /* SOCKET lifecycle                                                    */
-/* ------------------------------------------------------------------ */
 function openSocket () {
-  socketReady = false;
   ws = new WebSocket(WS_HOST);
 
   ws.on('open', async () => {
     console.log('✔︎ WS connected – sending APP-AUTH');
     try {
       await sendWS({
-        payloadType : 2101,                // ProtoOAApplicationAuthReq
+        payloadType : 2101, // ProtoOAApplicationAuthReq
         clientId    : CTRADER_CLIENT_ID,
         clientSecret: CTRADER_CLIENT_SECRET
       });
 
       console.log('✓ App-auth OK – sending ACCOUNT-AUTH');
       await sendWS({
-        payloadType       : 2102,          // ProtoOAAccountAuthReq
+        payloadType        : 2102, // ProtoOAAccountAuthReq
         ctidTraderAccountId: Number(CTRADER_ACCOUNT_ID),
         accessToken
       });
 
       socketReady = true;
-      reconnectDelay = 5_000;              // reset back-off
       startPing();
-
       console.log('✓ Account-auth OK — socket ready');
-      // opzionale: richiesta reconcile (non blocking, no timeout)
-      ws.send(JSON.stringify({
-        payloadType       : 2104,          // ProtoOAAssetListReq (esempio “light”)
-        ctidTraderAccountId: Number(CTRADER_ACCOUNT_ID)
-      }));
+      // *** NIENTE altro messaggio qui! *** (era la causa dei close)
     } catch (err) {
       console.error('❌ WS auth error', err.message);
       ws.close();
@@ -137,55 +119,35 @@ function openSocket () {
   });
 
   ws.on('message', buf => {
-    let m;
-    try { m = JSON.parse(buf.toString()); } catch { return; }
+    let m; try { m = JSON.parse(buf.toString()); } catch { return; }
+    const {payloadType, clientMsgId} = m;
 
-    const { payloadType, clientMsgId } = m;
-
-    // risposte attese da sendWS ------------------------------------------------
     if (clientMsgId && pending.has(clientMsgId)) {
-      const {resolve, timeoutId} = pending.get(clientMsgId);
-      clearTimeout(timeoutId);
+      pending.get(clientMsgId).resolve(m);
       pending.delete(clientMsgId);
-      return resolve(m);
-    }
-
-    // ping/pong ----------------------------------------------------------------
-    if (payloadType === 51) {             // ProtoOAPingRes
-      return;                             // nothing else to do
-    }
-
-    // execution / eventi -------------------------------------------------------
-    if (payloadType === 40) {             // ProtoOAExecutionEvent
-      console.log('▶︎ Execution event', JSON.stringify(m.payload));
       return;
     }
-
-    // errori -------------------------------------------------------------------
-    if (payloadType === 39) {             // ProtoOAErrorRes
-      console.warn('⚠︎ WS error', m.payload?.errorCode, m.payload?.description);
-    }
+    if (payloadType === 51) return;                 // PingRes
+    if (payloadType === 40)                         // ExecutionEvent
+      return console.log('▶︎ Execution', JSON.stringify(m.payload));
+    if (payloadType === 39)                         // ErrorRes
+      return console.warn('⚠︎ WS error', m.payload?.errorCode, m.payload?.description);
   });
 
-  ws.on('close', () => {
-    console.warn('WS closed – reconnect in', (reconnectDelay/1000).toFixed(1), 's');
-    stopPing();
-    // rigetta tutte le promesse pendenti
-    for (const {reject, timeoutId} of pending.values()) {
-      clearTimeout(timeoutId);
-      reject(new Error('WS closed'));
-    }
+  ws.on('close', (code, reason) => {
+    console.warn('WS closed', code, reason.toString());
+    socketReady = false;
+    clearInterval(pingTimer);
+    for (const {reject} of pending.values()) reject(new Error('WS closed'));
     pending.clear();
-    setTimeout(openSocket, reconnectDelay);
-    reconnectDelay = Math.min(reconnectDelay * 2, 60_000); // max 60 s
+    setTimeout(openSocket, 5_000);                  // fixed 5 s retry
   });
 
   ws.on('error', err => console.error('WS error', err.message));
 }
 
 /* ------------------------------------------------------------------ */
-/* HTTP mini-API (per Make)                                           */
-/* ------------------------------------------------------------------ */
+/* HTTP mini-API                                                       */
 const app = express();
 app.use(express.json());
 
@@ -195,9 +157,9 @@ app.post('/order', async (req, res) => {
 
   const {
     symbolId,
-    side,               // "BUY"/"SELL"
-    volume,             // in cent lots
-    type = 'MARKET',    // MARKET / LIMIT ...
+    side,
+    volume,
+    type = 'MARKET',
     limitPrice,
     stopPrice,
     tp, sl,
@@ -208,8 +170,9 @@ app.post('/order', async (req, res) => {
     return res.status(400).json({error:'symbolId, side, volume obbligatori'});
 
   const msg = {
-    payloadType        : 62,                 // ProtoOANewOrderReq
+    payloadType        : 62, // ProtoOANewOrderReq
     ctidTraderAccountId: Number(CTRADER_ACCOUNT_ID),
+    accessToken,
     symbolId           : Number(symbolId),
     orderType          : type,
     tradeSide          : side,
@@ -222,8 +185,8 @@ app.post('/order', async (req, res) => {
   };
 
   try {
-    const resp  = await sendWS(msg, 15_000);           // più largo (order → execution)
-    const exec  = resp.payload || {};
+    const resp = await sendWS(msg, 15_000);
+    const exec = resp.payload || {};
     if (exec.errorCode) throw new Error(exec.errorCode);
     return res.json({orderId: exec.order?.id, status: exec.executionType});
   } catch (err) {
@@ -232,10 +195,9 @@ app.post('/order', async (req, res) => {
 });
 
 /* ------------------------------------------------------------------ */
-/* BOOT                                                               */
-/* ------------------------------------------------------------------ */
-await refreshToken();       // ottieni access token
-openSocket();               // handshake + reconnect loop
+/* BOOT                                                                */
+await refreshToken();
+openSocket();
 
 const PORT = process.env.PORT || 8080;
 app.get('/', (_, r) => r.send('cTrader bridge running'));
