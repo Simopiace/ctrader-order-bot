@@ -3,9 +3,9 @@
   "version": "1.0.0",
   "type": "module",
   "main": "index.js",
-  "dependencies": {
+    "dependencies": {
     "express": "^4.19.0",
     "ws": "^8.15.0",
-    "node-fetch": "^3.4.1"
+    "node-fetch": "^3.3.2"
   }
 }
