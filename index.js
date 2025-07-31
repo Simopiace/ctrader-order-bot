@@ -117,7 +117,45 @@ async function refreshToken(delay = 0) {
 /* ------------------------------------------------------------------ */
 let ws;
 let heartbeatInterval;
+function authenticateAccount(accountId) {
+  console.log(`🔐 Authenticating account: ${accountId}`);
+  
+  ws.send(JSON.stringify({
+    clientMsgId : 'account_auth_'+Date.now(),
+    payloadType : 2102,              // ACCOUNT_AUTH_REQ
+    payload     : {
+      ctidTraderAccountId: Number(accountId),
+      accessToken
+    }
+  }));
+  
+  // Aspettiamo la risposta dell'account auth
+  ws.once('message', buf => {
+    let accountMsg;
+    try { 
+      accountMsg = JSON.parse(buf.toString()) 
+    } catch (e) { 
+      console.error('❌ Failed to parse ACCOUNT AUTH response:', e.message);
+      ws.close();
+      return;
+    }
+    
+    console.log('▶︎ WS ACCOUNT AUTH RES', accountMsg);
+    
+    if (accountMsg.payloadType === 2103) {     // ACCOUNT_AUTH_RES
+      console.log('✔︎ Account Auth ok – socket fully ready');
+      isAuthenticated = true;
+      currentAccountId = Number(accountId); // Salviamo l'ID corretto
+      startHeartbeat();
+    } else {
+      console.error('❌ Account Auth failed:', accountMsg.payload?.errorCode, accountMsg.payload?.description);
+      ws.close();
+    }
+  });
+}
+
 let isAuthenticated = false;
+let currentAccountId = null;
 
 function openSocket() {
   if (!accessToken) {
@@ -157,10 +195,61 @@ function openSocket() {
     console.log('▶︎ WS AUTH RES', msg);
 
     if (msg.payloadType === 2101) {     // APPLICATION_AUTH_RES
-      console.log('✔︎ App Auth ok – SKIPPING account auth for now');
-      console.log('🚨 TEMPORARY: Using app-level connection only');
-      isAuthenticated = true;
-      startHeartbeat();
+      console.log('✔︎ App Auth ok – requesting account list...');
+      
+      // Richiediamo la lista degli account tramite API
+      ws.send(JSON.stringify({
+        clientMsgId : 'get_accounts_'+Date.now(),
+        payloadType : 2149,              // TRADER_REQ
+        payload     : {
+          accessToken: accessToken
+        }
+      }));
+      
+      // Aspettiamo la risposta con la lista account
+      ws.once('message', buf2 => {
+        let accountListMsg;
+        try { 
+          accountListMsg = JSON.parse(buf2.toString()) 
+        } catch (e) { 
+          console.error('❌ Failed to parse ACCOUNT LIST response:', e.message);
+          ws.close();
+          return;
+        }
+        
+        console.log('▶︎ ACCOUNT LIST RESPONSE:', JSON.stringify(accountListMsg, null, 2));
+        
+        if (accountListMsg.payloadType === 2150) {     // TRADER_RES
+          if (accountListMsg.payload?.ctidTraderAccount && accountListMsg.payload.ctidTraderAccount.length > 0) {
+            console.log('📋 Available accounts:');
+            accountListMsg.payload.ctidTraderAccount.forEach((account, i) => {
+              console.log(`  ${i+1}. AccountID: ${account.ctidTraderAccountId}, Login: ${account.traderLogin}, ${account.isLive ? 'LIVE' : 'DEMO'}, Currency: ${account.depositAssetId}`);
+            });
+            
+            // Prendiamo il primo account demo disponibile
+            const demoAccount = accountListMsg.payload.ctidTraderAccount.find(acc => !acc.isLive);
+            if (demoAccount) {
+              console.log(`🎯 Using demo account ID: ${demoAccount.ctidTraderAccountId} (Login: ${demoAccount.traderLogin})`);
+              authenticateAccount(demoAccount.ctidTraderAccountId);
+            } else {
+              console.error('❌ No demo account found - using first available account');
+              const firstAccount = accountListMsg.payload.ctidTraderAccount[0];
+              console.log(`🎯 Using account ID: ${firstAccount.ctidTraderAccountId} (Login: ${firstAccount.traderLogin})`);
+              authenticateAccount(firstAccount.ctidTraderAccountId);
+            }
+          } else {
+            console.error('❌ No accounts found in response');
+            ws.close();
+          }
+        } else if (accountListMsg.payloadType === 2142) {
+          console.error('❌ Account list request failed:', accountListMsg.payload?.errorCode, accountListMsg.payload?.description);
+          ws.close();
+        } else {
+          console.error('❌ Unexpected account list response type:', accountListMsg.payloadType);
+          ws.close();
+        }
+      });
+      
       return;
     }
     
