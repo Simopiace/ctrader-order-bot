@@ -87,7 +87,7 @@ function openSocket () {
   ws.on('open', () => {
     console.log('✔︎ WS connected – sending AUTH');
     const authReq = {
-      clientMsgId : 'auth_'+Date.now(),
+      clientMsgId : 'auth_'+Date.now(),   // ID univoco che ci tornerà nel RES
       payloadType : 2100,                 // APPLICATION_AUTH_REQ
       payload     : {
         clientId    : CTRADER_CLIENT_ID,
@@ -98,13 +98,14 @@ function openSocket () {
     ws.send(JSON.stringify(authReq));
   });
 
+  // primo messaggio = esito autenticazione
   ws.once('message', buf => {
     let msg; try { msg = JSON.parse(buf.toString()) } catch { msg = {} }
     console.log('▶︎ WS AUTH RES raw', msg);
 
     if (msg.payloadType === 2101) {               // APPLICATION_AUTH_RES
       console.log('✔︎ Auth ok – socket pronto');
-      return;
+      return;                                     // tutto bene
     }
 
     const code = msg.payload?.errorCode;
@@ -122,19 +123,19 @@ function openSocket () {
 }
 
 /* ------------------------------------------------------------------ */
-/* MINI API HTTP (per Make / Zapier …)                                */
+/* MINI API HTTP (per Make / Zapier …)                                 */
 /* ------------------------------------------------------------------ */
 const app = express();
 app.use(express.json());
 
 app.post('/order', (req, res) => {
   const {
-    symbolId,                // ID numerico del simbolo
-    side,                    // "BUY" | "SELL"
-    volume,                  // in cent-lots (es. 100 000 = 1 lot)
-    price,                   // numero o {limit,stop} per STOP_LIMIT
-    tp, sl,                  // take-profit / stop-loss price
-    type = 'LIMIT'           // "MARKET" | "LIMIT" | "STOP" | "STOP_LIMIT"
+    symbolId,          // INT  – ID numerico del simbolo
+    side,              // "BUY" | "SELL"
+    volume,            // in cent-lots (es. 100 000 = 1 lot)
+    price,             // numero singolo oppure {limit,stop} per STOP_LIMIT
+    tp, sl,            // take-profit / stop-loss (prezzi)
+    type='LIMIT'       // "MARKET" | "LIMIT" | "STOP" | "STOP_LIMIT"
   } = req.body;
 
   if (!ws || ws.readyState !== WebSocket.OPEN)
@@ -142,26 +143,25 @@ app.post('/order', (req, res) => {
 
   const clientMsgId = 'ord_'+Date.now();
 
-  // mappa prezzi in base al tipo di ordine
-  const priceFields = (
+  // campi prezzo corretti per ogni tipo
+  const priceBlock =
     type === 'MARKET'      ? {} :
     type === 'LIMIT'       ? { limitPrice: Number(price) } :
     type === 'STOP'        ? { stopPrice : Number(price) } :
-    /* STOP_LIMIT */         { limitPrice: Number(price?.limit), stopPrice: Number(price?.stop) }
-  );
+    /* STOP_LIMIT */         { limitPrice: Number(price?.limit), stopPrice: Number(price?.stop) };
 
   const orderReq = {
     clientMsgId,
-    payloadType : 62,                       // ProtoOANewOrderReq
+    payloadType : 62,                        // ProtoOANewOrderReq
     payload     : {
-      ctidTraderAccountId: Number(CTRADER_ACCOUNT_ID),
-      symbolId          : Number(symbolId),
-      orderType         : type,             // enum string
-      tradeSide         : side,
-      volume            : Number(volume),
-      ...priceFields,
-      ...(tp && { takeProfit: { price: Number(tp) } }),
-      ...(sl && { stopLoss  : { price: Number(sl) } })
+      ctidTraderAccountId : Number(CTRADER_ACCOUNT_ID),
+      symbolId            : Number(symbolId),
+      orderType           : type,
+      tradeSide           : side,
+      volume              : Number(volume),
+      ...priceBlock,
+      ...(tp && { takeProfit: Number(tp) }),
+      ...(sl && { stopLoss : Number(sl) })
     }
   };
 
@@ -170,7 +170,7 @@ app.post('/order', (req, res) => {
 
     const once = data => {
       let m; try { m = JSON.parse(data.toString()) } catch { m = {} }
-      if (m.clientMsgId !== clientMsgId) return;   // risposta di un altro messaggio
+      if (m.clientMsgId !== clientMsgId) return;   // non è la nostra risposta
 
       ws.off('message', once);
 
@@ -187,7 +187,7 @@ app.post('/order', (req, res) => {
 });
 
 /* ------------------------------------------------------------------ */
-/* AVVIO                                                              */
+/* AVVIO                                                               */
 /* ------------------------------------------------------------------ */
 await refreshToken();      // ottiene il primo access-token
 openSocket();              // apre (e riapre) il WS
