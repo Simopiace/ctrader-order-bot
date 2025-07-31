@@ -143,7 +143,7 @@ app.post('/order', (req, res) => {
     price,
     tp,
     sl,
-    type = 'LIMIT'
+    type = '1'
   } = req.body || {};
 
   if (!ws || ws.readyState !== WebSocket.OPEN)
