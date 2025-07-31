@@ -24,30 +24,40 @@ let accessToken;
 let currentRefresh = INITIAL_REFRESH;
 
 // --- token ---
+// — Ottiene (e rinnova) un access-token
 async function refreshToken () {
   const res = await fetch('https://openapi.ctrader.com/apps/token', {
-    method  : 'POST',
-    headers : { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body    : new URLSearchParams({
-      grant_type   : 'refresh_token',
-      client_id    : CTRADER_CLIENT_ID,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type:    'refresh_token',
+      client_id:     CTRADER_CLIENT_ID,
       client_secret: CTRADER_CLIENT_SECRET,
       refresh_token: currentRefresh
     })
   });
 
-  const txt = await res.text();
-  if (!res.ok) {
-    console.error('Token refresh failed ⇒', res.status, txt.slice(0,120));
+  const txt = await res.text();                 // leggiamo come testo
+  if (!res.ok) {                                // 4xx / 5xx ⇒ fermo la VM
+    console.error('Token refresh failed ⇒', res.status, txt.slice(0,200));
     process.exit(1);
   }
 
   const j = JSON.parse(txt);
-  accessToken   = j.access_token;
-  currentRefresh = j.refresh_token || currentRefresh;
-  console.log('✔︎ Token ok. Next refresh in', j.expires_in, 'sec');
-  setTimeout(refreshToken, (j.expires_in - 60) * 1000);
+
+  accessToken    = j.accessToken   ?? j.access_token;
+  currentRefresh = j.refreshToken  ?? j.refresh_token ?? currentRefresh;
+
+  // prende expiresIn (camelCase) o expires_in, altrimenti fallback 900 s
+  const expires = Number(j.expiresIn ?? j.expires_in) || 900;
+
+  console.log('✔︎ Token ok. Next refresh in', expires, 'sec');
+
+  // minimo 5 min tra un refresh e l’altro, altrimenti Spotware → 429
+  const delay = Math.max(expires - 60, 300);
+  setTimeout(refreshToken, delay * 1000);
 }
+
 
 // --- websocket ---
 function openSocket () {
