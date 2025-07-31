@@ -15,8 +15,8 @@ const {
 
 const WS_HOST =
   CTRADER_ENV === 'live'
-    ? 'wss://live.ctraderapi.com:5036'
-    : 'wss://demo.ctraderapi.com:5036';
+    ? 'wss://live.ctraderapi.com:5036/stream?format=json'   // ★ nuovo
+    : 'wss://demo.ctraderapi.com:5036/stream?format=json';  // ★ nuovo
 
 let ws;
 let accessToken;
@@ -64,16 +64,17 @@ function openSocket() {
 
   ws.on('open', () => {
     console.log('✔︎ WS connected');
-    ws.send(
-      JSON.stringify({
-        payloadType: 'PROTOCOL_APPLICATION_AUTH_REQ',
-        payload: {
-          clientId:     CTRADER_CLIENT_ID,
-          clientSecret: CTRADER_CLIENT_SECRET,
-          accessToken
-        }
-      })
-    );
+   ws.send(
+  JSON.stringify({
+-   payloadType: 'PROTOCOL_APPLICATION_AUTH_REQ',           // vecchio
++   payloadType: 'ProtoOAApplicationAuthReq',               // ★ nuovo
+    payload: {
+      clientId:     CTRADER_CLIENT_ID,
+      clientSecret: CTRADER_CLIENT_SECRET,
+      accessToken
+    }
+  })
+);
   });
 
   ws.on('close', () => {
