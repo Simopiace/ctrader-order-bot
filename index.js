@@ -157,13 +157,45 @@ function openSocket() {
     console.log('▶︎ WS AUTH RES', msg);
 
     if (msg.payloadType === 2101) {     // APPLICATION_AUTH_RES
-      console.log('✔︎ Auth ok – socket pronto');
-      isAuthenticated = true;
-      startHeartbeat();
+      console.log('✔︎ App Auth ok – now authenticating account...');
+      
+      // Ora dobbiamo autenticare l'account trading
+      ws.send(JSON.stringify({
+        clientMsgId : 'account_auth_'+Date.now(),
+        payloadType : 2102,              // ACCOUNT_AUTH_REQ
+        payload     : {
+          ctidTraderAccountId: Number(CTRADER_ACCOUNT_ID),
+          accessToken
+        }
+      }));
+      
+      // Aspettiamo la risposta dell'account auth
+      ws.once('message', buf2 => {
+        let accountMsg;
+        try { 
+          accountMsg = JSON.parse(buf2.toString()) 
+        } catch (e) { 
+          console.error('❌ Failed to parse ACCOUNT AUTH response:', e.message);
+          ws.close();
+          return;
+        }
+        
+        console.log('▶︎ WS ACCOUNT AUTH RES', accountMsg);
+        
+        if (accountMsg.payloadType === 2103) {     // ACCOUNT_AUTH_RES
+          console.log('✔︎ Account Auth ok – socket fully ready');
+          isAuthenticated = true;
+          startHeartbeat();
+        } else {
+          console.error('❌ Account Auth failed:', accountMsg.payload?.errorCode, accountMsg.payload?.description);
+          ws.close();
+        }
+      });
+      
       return;
     }
     
-    console.error('❌ Auth failed:', msg.payload?.errorCode, msg.payload?.description);
+    console.error('❌ App Auth failed:', msg.payload?.errorCode, msg.payload?.description);
     ws.close();
   });
 
@@ -299,16 +331,16 @@ app.post('/order', (req, res) => {
 
   const orderReq = {
     clientMsgId,
-    payloadType : 2106,                       // ORDER_NEW_REQ (JSON)
+    payloadType : 2106,                       // NEW_ORDER_REQ (JSON)
     payload     : {
       ctidTraderAccountId      : Number(CTRADER_ACCOUNT_ID),
       ...(symbolId ? { symbolId: Number(symbolId) } : { symbolName: symbol }),
-      orderType      : type,                  // MARKET | LIMIT | STOP
-      tradeSide      : side,                  // BUY   | SELL
+      orderType      : Number(type),            // MARKET | LIMIT | STOP
+      tradeSide      : Number(side),            // BUY   | SELL
       volume         : Number(volume),
       ...(type !== '1' ? { requestedPrice: Number(price) } : {}),
-      ...(tp !== undefined ? { takeProfit: { price: Number(tp) } } : {}),
-      ...(sl !== undefined ? { stopLoss  : { price: Number(sl) } } : {})
+      ...(tp !== undefined ? { takeProfitPrice: Number(tp) } : {}),
+      ...(sl !== undefined ? { stopLossPrice: Number(sl) } : {})
     }
   };
 
