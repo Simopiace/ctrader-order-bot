@@ -126,12 +126,12 @@ app.use(express.json());
    POST /order
    {
      "symbolId": 1          // OPPURE "symbol": "EURUSD"
-     "side": "BUY"|"SELL",
+     "side": "BUY(1)"|"SELL(2)",
      "volume": 100000,      // cent-units (100 000 = 1 lot standard)
      "price": 1.23456,      // richiesto per LIMIT / STOP
      "tp": 1.24000,         // opzionale
      "sl": 1.23000,         // opzionale
-     "type": "MARKET"|"LIMIT"|"STOP" (default LIMIT)
+     "type": "1"|"2"|"3" (default 1)
    }
 */
 app.post('/order', (req, res) => {
@@ -150,7 +150,7 @@ app.post('/order', (req, res) => {
     return res.status(503).json({ error: 'socket not ready' });
 
   // validazione minima
-  if (!(symbolId || symbol) || !side || !volume || (type !== 'MARKET' && price === undefined))
+  if (!(symbolId || symbol) || !side || !volume || (type !== '1' && price === undefined))
     return res.status(400).json({ error: 'missing parameters' });
 
   const clientMsgId = 'ord_'+Date.now();
