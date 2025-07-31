@@ -88,13 +88,12 @@ function openSocket () {
     sendWS({
       payloadType : 2101,                // ProtoOAApplicationAuthReq
       clientId    : CTRADER_CLIENT_ID,
-      clientSecret: CTRADER_CLIENT_SECRET,
-      accessToken                         // OPTIONAL – non serve qui
+      clientSecret: CTRADER_CLIENT_SECRET
     })
     .then(() => {
       console.log('✓ App-auth OK – sending ACCOUNT-AUTH');
       return sendWS({
-        payloadType       : 2102,        // ProtoOAAccountAuthReq
+        payloadType        : 2102,       // ProtoOAAccountAuthReq
         ctidTraderAccountId: Number(CTRADER_ACCOUNT_ID),
         accessToken
       });
