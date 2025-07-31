@@ -1,539 +1,575 @@
-// index.js  – ponte HTTP ⇄ WebSocket per cTrader Open API (JSON)
-// Node ≥ 18 con "type": "module" in package.json
+// 🚀 cTrader Trading Bridge - Clean & Robust Version
+// Telegram → Make.com → This Bridge → cTrader
+// Node.js 18+ with "type": "module" in package.json
 
-import express   from 'express';
-import fetch     from 'node-fetch';
+import express from 'express';
+import fetch from 'node-fetch';
 import WebSocket from 'ws';
 
-/* ------------------------------------------------------------------ */
-/* ENV                                                                */
-/* ------------------------------------------------------------------ */
+/* ========================================
+   📋 CONFIGURATION & CONSTANTS
+   ======================================== */
+
 const {
   CTRADER_CLIENT_ID,
-  CTRADER_CLIENT_SECRET,
-  CTRADER_REFRESH_TOKEN: INITIAL_REFRESH,
+  CTRADER_CLIENT_SECRET, 
+  CTRADER_REFRESH_TOKEN,
   CTRADER_ACCOUNT_ID,
-  CTRADER_ENV = 'demo',   // 'demo' | 'live'
-  PORT         = 8080
+  CTRADER_ENV = 'demo', // 'demo' | 'live'
+  PORT = 8080
 } = process.env;
 
-console.log('🚀 Starting cTrader bridge...');
-console.log('ENV:', CTRADER_ENV);
-console.log('PORT:', PORT);
-console.log('Has CLIENT_ID:', !!CTRADER_CLIENT_ID);
-console.log('Has CLIENT_SECRET:', !!CTRADER_CLIENT_SECRET);
-console.log('Has REFRESH_TOKEN:', !!INITIAL_REFRESH);
-console.log('Has ACCOUNT_ID:', !!CTRADER_ACCOUNT_ID);
+// WebSocket endpoints
+const WS_ENDPOINTS = {
+  demo: 'wss://demo.ctraderapi.com:5036',
+  live: 'wss://live.ctraderapi.com:5036'
+};
 
-if (!CTRADER_CLIENT_ID || !CTRADER_CLIENT_SECRET || !INITIAL_REFRESH) {
-  console.error('❌ Variabili d\'ambiente mancanti:');
-  console.error('CTRADER_CLIENT_ID:', !!CTRADER_CLIENT_ID);
-  console.error('CTRADER_CLIENT_SECRET:', !!CTRADER_CLIENT_SECRET);
-  console.error('CTRADER_REFRESH_TOKEN:', !!INITIAL_REFRESH);
-  process.exit(1);
-}
+// PayloadTypes (cTrader protocol)
+const MSG_TYPES = {
+  APPLICATION_AUTH_REQ: 2100,
+  APPLICATION_AUTH_RES: 2101,
+  ACCOUNT_AUTH_REQ: 2102,
+  ACCOUNT_AUTH_RES: 2103,
+  NEW_ORDER_REQ: 2106,
+  NEW_ORDER_RES: 2121,
+  HEARTBEAT_EVENT: 51,
+  ERROR_RES: 2142
+};
 
-/* ------------------------------------------------------------------ */
-/* COSTANTI                                                           */
-/* ------------------------------------------------------------------ */
-const WS_HOST =
-  CTRADER_ENV === 'live'
-    ? 'wss://live.ctraderapi.com:5036'     // endpoint JSON
-    : 'wss://demo.ctraderapi.com:5036';
+// Symbol mapping (extend as needed)
+const SYMBOLS = {
+  'EURUSD': 1,
+  'GBPUSD': 2,
+  'USDJPY': 3,
+  'USDCHF': 4,
+  'AUDUSD': 5,
+  'USDCAD': 6,
+  'NZDUSD': 7
+};
 
-console.log('WS_HOST:', WS_HOST);
+/* ========================================
+   🔐 TOKEN MANAGER
+   ======================================== */
 
-/* ------------------------------------------------------------------ */
-/* TOKEN (OAuth2)                                                     */
-/* ------------------------------------------------------------------ */
-let accessToken;
-let currentRefresh = INITIAL_REFRESH;
-
-async function refreshToken(delay = 0) {
-  if (delay) {
-    console.log(`⏳ Waiting ${delay/1000}s before token refresh...`);
-    await new Promise(r => setTimeout(r, delay));
+class TokenManager {
+  constructor() {
+    this.accessToken = null;
+    this.refreshToken = CTRADER_REFRESH_TOKEN;
+    this.expiryTime = 0;
+    this.refreshTimeout = null;
   }
 
-  try {
-    console.log('🔄 Refreshing token...');
-    
-    const res = await fetch('https://openapi.ctrader.com/apps/token', {
-      method : 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body   : new URLSearchParams({
-        grant_type   : 'refresh_token',
-        client_id    : CTRADER_CLIENT_ID,
-        client_secret: CTRADER_CLIENT_SECRET,
-        refresh_token: currentRefresh
-      })
-    });
-
-    if (res.status === 429) {                       // rate-limit
-      const wait = 30_000 + Math.random()*30_000;
-      console.warn('↻ 429 Too Many Requests – retry in', (wait/1000).toFixed(1), 's');
-      return refreshToken(wait);
-    }
-    
-    if (!res.ok) {
-      const errorText = await res.text();
-      throw new Error(`HTTP ${res.status}: ${errorText}`);
+  async getValidToken() {
+    // Check if current token is still valid (with 5min buffer)
+    if (this.accessToken && Date.now() < this.expiryTime - 300000) {
+      return this.accessToken;
     }
 
-    const j = await res.json();
-    console.log('Token response fields:', Object.keys(j));
-    
-    if (!j.access_token) {
-      throw new Error('No access_token in response: ' + JSON.stringify(j));
-    }
-    
-    accessToken    = j.access_token;
-    currentRefresh = j.refresh_token || currentRefresh;
-
-    const ttl = j.expires_in ?? j.expiresIn ?? 900;
-    console.log('✔︎ Token refreshed successfully – expires in', ttl, 's');
-
-    // Limita il timeout per evitare overflow (max 24 ore)
-    const maxTimeout = 24 * 60 * 60 * 1000; // 24 ore in ms
-    const refreshTime = Math.min((ttl - 60) * 1000, maxTimeout);
-    
-    console.log(`Next refresh in ${refreshTime/1000/60} minutes`);
-    
-    // Schedule next refresh
-    setTimeout(refreshToken, refreshTime);
-    
-    return true;
-  }
-  catch (err) {
-    console.error('⚠︎ Token refresh error:', err.message);
-    const wait = 60_000 + Math.random()*60_000;
-    console.log(`⏳ Retrying token refresh in ${wait/1000}s...`);
-    setTimeout(() => refreshToken(wait), wait);
-    throw err; // Re-throw for initial startup
-  }
-}
-
-/* ------------------------------------------------------------------ */
-/* WEBSOCKET                                                          */
-/* ------------------------------------------------------------------ */
-let ws;
-let heartbeatInterval;
-let isAuthenticated = false;
-let currentAccountId = null;
-
-function openSocket() {
-  if (!accessToken) {
-    console.error('❌ No access token available for WebSocket connection');
-    return;
+    return await this.refreshAccessToken();
   }
 
-  console.log('🔌 Opening WebSocket connection...');
-  ws = new WebSocket(WS_HOST);
+  async refreshAccessToken() {
+    try {
+      console.log('🔄 Refreshing access token...');
+      
+      const response = await fetch('https://openapi.ctrader.com/apps/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'refresh_token',
+          refresh_token: this.refreshToken,
+          client_id: CTRADER_CLIENT_ID,
+          client_secret: CTRADER_CLIENT_SECRET
+        })
+      });
 
-  ws.on('open', () => {
-    console.log('✔︎ WS connected – sending AUTH');
-    isAuthenticated = false;
-    
-    ws.send(JSON.stringify({
-      clientMsgId : 'auth_'+Date.now(),
-      payloadType : 2100,              // APPLICATION_AUTH_REQ
-      payload     : {
-        clientId    : CTRADER_CLIENT_ID,
-        clientSecret: CTRADER_CLIENT_SECRET,
-        accessToken
+      if (!response.ok) {
+        throw new Error(`Token refresh failed: ${response.status}`);
       }
-    }));
-  });
 
-  // primo messaggio = AUTH RES
-  ws.once('message', buf => {
-    let msg;
-    try { 
-      msg = JSON.parse(buf.toString()) 
-    } catch (e) { 
-      console.error('❌ Failed to parse AUTH response:', e.message);
-      ws.close();
-      return;
+      const data = await response.json();
+      
+      if (data.errorCode) {
+        throw new Error(`Token error: ${data.errorCode} - ${data.description}`);
+      }
+
+      this.accessToken = data.accessToken;
+      this.refreshToken = data.refreshToken || this.refreshToken;
+      
+      // Set expiry time (default 15 minutes)
+      const expiresIn = data.expiresIn || 900;
+      this.expiryTime = Date.now() + (expiresIn * 1000);
+
+      console.log(`✅ Token refreshed successfully (expires in ${expiresIn}s)`);
+      
+      // Schedule next refresh (5 minutes before expiry)
+      this.scheduleNextRefresh(expiresIn - 300);
+      
+      return this.accessToken;
+
+    } catch (error) {
+      console.error('❌ Token refresh failed:', error.message);
+      throw error;
     }
-    
-    console.log('▶︎ WS AUTH RES', msg);
+  }
 
-    if (msg.payloadType === 2101) {     // APPLICATION_AUTH_RES
-      console.log('✔︎ App Auth ok – requesting account list...');
+  scheduleNextRefresh(seconds) {
+    if (this.refreshTimeout) {
+      clearTimeout(this.refreshTimeout);
+    }
+
+    // Limit timeout to max 24 hours to prevent overflow
+    const maxTimeout = 24 * 60 * 60; // 24 hours
+    const safeTimeout = Math.min(Math.max(seconds, 60), maxTimeout);
+    
+    console.log(`⏰ Next token refresh in ${Math.round(safeTimeout/60)} minutes`);
+    
+    this.refreshTimeout = setTimeout(() => {
+      this.refreshAccessToken().catch(console.error);
+    }, safeTimeout * 1000);
+  }
+
+  destroy() {
+    if (this.refreshTimeout) {
+      clearTimeout(this.refreshTimeout);
+    }
+  }
+}
+
+/* ========================================
+   🔌 WEBSOCKET CLIENT
+   ======================================== */
+
+class cTraderClient {
+  constructor(tokenManager) {
+    this.tokenManager = tokenManager;
+    this.ws = null;
+    this.isAuthenticated = false;
+    this.accountId = CTRADER_ACCOUNT_ID;
+    this.heartbeatInterval = null;
+    this.reconnectTimeout = null;
+    this.messageHandlers = new Map();
+  }
+
+  async connect() {
+    try {
+      const wsUrl = WS_ENDPOINTS[CTRADER_ENV];
+      console.log(`🔌 Connecting to ${CTRADER_ENV} WebSocket...`);
       
-      // Richiediamo la lista degli account
-      ws.send(JSON.stringify({
-        clientMsgId : 'get_accounts_'+Date.now(),
-        payloadType : 2149,              // TRADER_REQ
-        payload     : {
-          accessToken: accessToken
-        }
-      }));
+      this.ws = new WebSocket(wsUrl);
       
-      // Aspettiamo la risposta con la lista account
-      ws.once('message', buf2 => {
-        let accountListMsg;
-        try { 
-          accountListMsg = JSON.parse(buf2.toString()) 
-        } catch (e) { 
-          console.error('❌ Failed to parse ACCOUNT LIST response:', e.message);
-          ws.close();
-          return;
+      this.ws.on('open', () => this.onOpen());
+      this.ws.on('message', (data) => this.onMessage(data));
+      this.ws.on('close', (code, reason) => this.onClose(code, reason));
+      this.ws.on('error', (error) => this.onError(error));
+
+    } catch (error) {
+      console.error('❌ WebSocket connection failed:', error);
+      this.scheduleReconnect();
+    }
+  }
+
+  async onOpen() {
+    console.log('✅ WebSocket connected - authenticating...');
+    await this.authenticateApplication();
+  }
+
+  onMessage(data) {
+    try {
+      const message = JSON.parse(data.toString());
+      this.handleMessage(message);
+    } catch (error) {
+      console.error('❌ Failed to parse message:', error);
+    }
+  }
+
+  onClose(code, reason) {
+    console.log(`⚠️  WebSocket closed (${code}): ${reason}`);
+    this.isAuthenticated = false;
+    this.stopHeartbeat();
+    this.scheduleReconnect();
+  }
+
+  onError(error) {
+    console.error('❌ WebSocket error:', error);
+  }
+
+  async authenticateApplication() {
+    try {
+      const token = await this.tokenManager.getValidToken();
+      
+      const authMessage = {
+        clientMsgId: `app_auth_${Date.now()}`,
+        payloadType: MSG_TYPES.APPLICATION_AUTH_REQ,
+        payload: {
+          clientId: CTRADER_CLIENT_ID,
+          clientSecret: CTRADER_CLIENT_SECRET,
+          accessToken: token
         }
-        
-        console.log('▶︎ ACCOUNT LIST RESPONSE:', JSON.stringify(accountListMsg, null, 2));
-        
-        if (accountListMsg.payloadType === 2150) {     // TRADER_RES
-          if (accountListMsg.payload?.ctidTraderAccount && accountListMsg.payload.ctidTraderAccount.length > 0) {
-            console.log('📋 Available accounts:');
-            accountListMsg.payload.ctidTraderAccount.forEach((account, i) => {
-              console.log(`  ${i+1}. AccountID: ${account.ctidTraderAccountId}, Login: ${account.traderLogin}, ${account.isLive ? 'LIVE' : 'DEMO'}, Currency: ${account.depositAssetId}`);
-            });
-            
-            // Cerchiamo prima l'account FP Markets con login 1056968
-            const targetAccount = accountListMsg.payload.ctidTraderAccount.find(acc => 
-              !acc.isLive && acc.traderLogin === 1056968
-            );
-            
-            if (targetAccount) {
-              console.log(`🎯 Using target demo account ID: ${targetAccount.ctidTraderAccountId} (Login: ${targetAccount.traderLogin})`);
-              authenticateAccount(targetAccount.ctidTraderAccountId);
-            } else {
-              // Fallback al primo account demo
-              const demoAccount = accountListMsg.payload.ctidTraderAccount.find(acc => !acc.isLive);
-              if (demoAccount) {
-                console.log(`🎯 Using demo account ID: ${demoAccount.ctidTraderAccountId} (Login: ${demoAccount.traderLogin})`);
-                authenticateAccount(demoAccount.ctidTraderAccountId);
-              } else {
-                console.error('❌ No demo account found - using first available account');
-                const firstAccount = accountListMsg.payload.ctidTraderAccount[0];
-                console.log(`🎯 Using account ID: ${firstAccount.ctidTraderAccountId} (Login: ${firstAccount.traderLogin})`);
-                authenticateAccount(firstAccount.ctidTraderAccountId);
-              }
-            }
-          } else {
-            console.error('❌ No accounts found in response');
-            ws.close();
-          }
-        } else if (accountListMsg.payloadType === 2142) {
-          console.error('❌ Account list request failed:', accountListMsg.payload?.errorCode, accountListMsg.payload?.description);
-          ws.close();
+      };
+
+      this.sendMessage(authMessage);
+    } catch (error) {
+      console.error('❌ Application auth failed:', error);
+      this.scheduleReconnect();
+    }
+  }
+
+  async authenticateAccount() {
+    try {
+      const token = await this.tokenManager.getValidToken();
+      
+      const authMessage = {
+        clientMsgId: `acc_auth_${Date.now()}`,
+        payloadType: MSG_TYPES.ACCOUNT_AUTH_REQ,
+        payload: {
+          ctidTraderAccountId: parseInt(this.accountId),
+          accessToken: token
+        }
+      };
+
+      this.sendMessage(authMessage);
+    } catch (error) {
+      console.error('❌ Account auth failed:', error);
+    }
+  }
+
+  handleMessage(message) {
+    const { payloadType, clientMsgId } = message;
+
+    // Skip heartbeat spam in logs
+    if (payloadType !== MSG_TYPES.HEARTBEAT_EVENT) {
+      console.log(`📨 Message: ${payloadType} (${clientMsgId || 'no-id'})`);
+    }
+
+    switch (payloadType) {
+      case MSG_TYPES.APPLICATION_AUTH_RES:
+        console.log('✅ Application authenticated - authenticating account...');
+        this.authenticateAccount();
+        break;
+
+      case MSG_TYPES.ACCOUNT_AUTH_RES:
+        if (message.payload?.errorCode) {
+          console.error('❌ Account auth failed:', message.payload.description);
         } else {
-          console.error('❌ Unexpected account list response type:', accountListMsg.payloadType);
-          ws.close();
+          console.log('✅ Account authenticated - starting heartbeat...');
+          this.isAuthenticated = true;
+          this.startHeartbeat();
+        }
+        break;
+
+      case MSG_TYPES.NEW_ORDER_RES:
+        this.handleOrderResponse(message);
+        break;
+
+      case MSG_TYPES.ERROR_RES:
+        console.error('❌ API Error:', message.payload);
+        break;
+
+      case MSG_TYPES.HEARTBEAT_EVENT:
+        // Heartbeat response - connection is alive
+        break;
+
+      default:
+        // Handle custom message handlers
+        const handler = this.messageHandlers.get(clientMsgId);
+        if (handler) {
+          handler(message);
+          this.messageHandlers.delete(clientMsgId);
+        }
+    }
+  }
+
+  handleOrderResponse(message) {
+    if (message.payload?.errorCode) {
+      console.error('❌ Order failed:', message.payload.description);
+    } else {
+      console.log('✅ Order executed successfully:', message.payload);
+    }
+  }
+
+  sendMessage(message) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(message));
+      return true;
+    }
+    return false;
+  }
+
+  // Send trading order
+  async sendOrder(orderData) {
+    if (!this.isAuthenticated) {
+      throw new Error('Not authenticated');
+    }
+
+    const orderMessage = {
+      clientMsgId: `order_${Date.now()}`,
+      payloadType: MSG_TYPES.NEW_ORDER_REQ,
+      payload: {
+        ctidTraderAccountId: parseInt(this.accountId),
+        symbolId: orderData.symbolId,
+        orderType: orderData.type || 'MARKET',
+        tradeSide: orderData.side === '1' ? 'BUY' : 'SELL',
+        volume: orderData.volume,
+        ...(orderData.stopLoss && { stopLoss: orderData.stopLoss }),
+        ...(orderData.takeProfit && { takeProfit: orderData.takeProfit }),
+        ...(orderData.comment && { comment: orderData.comment })
+      }
+    };
+
+    return new Promise((resolve, reject) => {
+      // Set timeout for order response
+      const timeout = setTimeout(() => {
+        this.messageHandlers.delete(orderMessage.clientMsgId);
+        reject(new Error('Order timeout'));
+      }, 10000);
+
+      // Set response handler
+      this.messageHandlers.set(orderMessage.clientMsgId, (response) => {
+        clearTimeout(timeout);
+        
+        if (response.payload?.errorCode) {
+          reject(new Error(`Order failed: ${response.payload.description}`));
+        } else {
+          resolve(response.payload);
         }
       });
-      
-      return;
-    }
+
+      // Send order
+      if (!this.sendMessage(orderMessage)) {
+        clearTimeout(timeout);
+        this.messageHandlers.delete(orderMessage.clientMsgId);
+        reject(new Error('WebSocket not connected'));
+      }
+    });
+  }
+
+  startHeartbeat() {
+    this.stopHeartbeat();
     
-    console.error('❌ App Auth failed:', msg.payload?.errorCode, msg.payload?.description);
-    ws.close();
-  });
+    this.heartbeatInterval = setInterval(() => {
+      if (this.isAuthenticated) {
+        const heartbeat = {
+          clientMsgId: `heartbeat_${Date.now()}`,
+          payloadType: MSG_TYPES.HEARTBEAT_EVENT,
+          payload: {}
+        };
+        
+        this.sendMessage(heartbeat);
+      }
+    }, 25000); // Every 25 seconds
+  }
 
-  // Gestisci tutti i messaggi successivi
-  ws.on('message', buf => {
-    let msg;
-    try { 
-      msg = JSON.parse(buf.toString()) 
-    } catch (e) { 
-      console.error('❌ Failed to parse message:', e.message);
-      return;
+  stopHeartbeat() {
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
     }
+  }
+
+  scheduleReconnect() {
+    if (this.reconnectTimeout) return;
+
+    console.log('⏳ Reconnecting in 5 seconds...');
+    this.reconnectTimeout = setTimeout(() => {
+      this.reconnectTimeout = null;
+      this.connect();
+    }, 5000);
+  }
+
+  disconnect() {
+    this.stopHeartbeat();
     
-    // Log solo messaggi non-heartbeat per ridurre spam
-    if (msg.payloadType !== 51) { // HEARTBEAT_EVENT
-      console.log('▶︎ WS MSG', msg.payloadType, msg.clientMsgId || 'no-id');
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+      this.reconnectTimeout = null;
     }
-  });
 
-  ws.on('close', (code, reason) => {
-    console.warn(`⚠︎ WS closed (${code}): ${reason || 'no reason'} – reconnect in 5s`);
-    isAuthenticated = false;
-    stopHeartbeat();
-    setTimeout(openSocket, 5000);
-  });
-
-  ws.on('error', err => {
-    console.error('❌ WS error:', err.message);
-    isAuthenticated = false;
-    stopHeartbeat();
-  });
-}
-
-function authenticateAccount(accountId) {
-  console.log(`🔐 Authenticating account: ${accountId}`);
-  
-  ws.send(JSON.stringify({
-    clientMsgId : 'account_auth_'+Date.now(),
-    payloadType : 2102,              // ACCOUNT_AUTH_REQ
-    payload     : {
-      ctidTraderAccountId: Number(accountId),
-      accessToken
+    if (this.ws) {
+      this.ws.close();
     }
-  }));
-  
-  // Aspettiamo la risposta dell'account auth
-  ws.once('message', buf => {
-    let accountMsg;
-    try { 
-      accountMsg = JSON.parse(buf.toString()) 
-    } catch (e) { 
-      console.error('❌ Failed to parse ACCOUNT AUTH response:', e.message);
-      ws.close();
-      return;
-    }
-    
-    console.log('▶︎ WS ACCOUNT AUTH RES', accountMsg);
-    
-    if (accountMsg.payloadType === 2103) {     // ACCOUNT_AUTH_RES
-      console.log('✔︎ Account Auth ok – socket fully ready');
-      isAuthenticated = true;
-      currentAccountId = Number(accountId);
-      startHeartbeat();
-    } else {
-      console.error('❌ Account Auth failed:', accountMsg.payload?.errorCode, accountMsg.payload?.description);
-      ws.close();
-    }
-  });
-}
+  }
 
-function startHeartbeat() {
-  stopHeartbeat(); // pulisci eventuale precedente
-  
-  console.log('♥ Starting heartbeat...');
-  heartbeatInterval = setInterval(() => {
-    if (ws && ws.readyState === WebSocket.OPEN && isAuthenticated) {
-      ws.send(JSON.stringify({
-        clientMsgId: 'ping_' + Date.now(),
-        payloadType: 51, // HEARTBEAT_EVENT
-        payload: {}
-      }));
-      // console.log('♥ Heartbeat sent'); // Uncomment for debugging
-    }
-  }, 10000); // ogni 10 secondi
-}
-
-function stopHeartbeat() {
-  if (heartbeatInterval) {
-    console.log('♥ Stopping heartbeat...');
-    clearInterval(heartbeatInterval);
-    heartbeatInterval = null;
+  isReady() {
+    return this.ws && 
+           this.ws.readyState === WebSocket.OPEN && 
+           this.isAuthenticated;
   }
 }
 
-/* ------------------------------------------------------------------ */
-/* MINI API HTTP (es. Make/Zapier)                                    */
-/* ------------------------------------------------------------------ */
+/* ========================================
+   🌐 HTTP SERVER
+   ======================================== */
+
+// Validate environment variables
+function validateConfig() {
+  const required = [
+    'CTRADER_CLIENT_ID',
+    'CTRADER_CLIENT_SECRET', 
+    'CTRADER_REFRESH_TOKEN',
+    'CTRADER_ACCOUNT_ID'
+  ];
+
+  const missing = required.filter(key => !process.env[key]);
+  
+  if (missing.length > 0) {
+    console.error('❌ Missing required environment variables:', missing);
+    process.exit(1);
+  }
+
+  console.log('✅ Configuration validated');
+}
+
+// Create instances
+validateConfig();
+const tokenManager = new TokenManager();
+const ctraderClient = new cTraderClient(tokenManager);
 const app = express();
+
+// Middleware
 app.use(express.json());
 
 // Health check endpoint
 app.get('/', (req, res) => {
   const status = {
     status: 'running',
-    websocket: ws ? (ws.readyState === WebSocket.OPEN ? 'connected' : 'disconnected') : 'not_initialized',
-    authenticated: isAuthenticated,
-    accountId: currentAccountId,
+    environment: CTRADER_ENV,
+    websocket: ctraderClient.isReady() ? 'connected' : 'disconnected',
     timestamp: new Date().toISOString()
   };
+  
   res.json(status);
 });
 
-// Status endpoint
-app.get('/status', (req, res) => {
-  const status = {
-    websocket_ready: ws && ws.readyState === WebSocket.OPEN && isAuthenticated,
-    websocket_state: ws ? ws.readyState : 'none',
-    authenticated: isAuthenticated,
-    has_token: !!accessToken,
-    account_id: currentAccountId,
-    environment: CTRADER_ENV
-  };
-  res.json(status);
-});
-
-/*
-   POST /order
-   {
-     "symbolId": 1          // OPPURE "symbol": "EURUSD"
-     "side": "1"|"2",       // BUY=1, SELL=2
-     "volume": 100000,      // cent-units (100 000 = 1 lot standard)
-     "price": 1.23456,      // richiesto per LIMIT / STOP
-     "tp": 1.24000,         // opzionale
-     "sl": 1.23000,         // opzionale
-     "type": "1"|"2"|"3"    // MARKET=1, LIMIT=2, STOP=3 (default 1)
-   }
-*/
-app.post('/order', (req, res) => {
-  console.log('📝 Order request received:', req.body);
-
-  const {
-    symbolId,          // INT – preferibile
-    symbol,            // stringa – alternativa
-    side,
-    volume,
-    price,
-    tp,
-    sl,
-    type = '1'
-  } = req.body || {};
-
-  if (!ws || ws.readyState !== WebSocket.OPEN || !isAuthenticated) {
-    console.error('❌ Socket not ready:', {
-      ws_exists: !!ws,
-      ws_state: ws ? ws.readyState : 'none',
-      authenticated: isAuthenticated,
-      account_id: currentAccountId
-    });
-    return res.status(503).json({ 
-      error: 'socket not ready',
-      ws_state: ws ? ws.readyState : 'none',
-      authenticated: isAuthenticated,
-      account_id: currentAccountId
-    });
-  }
-
-  // validazione minima
-  if (!(symbolId || symbol) || !side || !volume || (type !== '1' && price === undefined)) {
-    console.error('❌ Missing parameters:', { symbolId, symbol, side, volume, price, type });
-    return res.status(400).json({ error: 'missing parameters' });
-  }
-
-  const clientMsgId = 'ord_'+Date.now();
-
-  const orderReq = {
-    clientMsgId,
-    payloadType : 2106,                       // NEW_ORDER_REQ
-    payload     : {
-      ctidTraderAccountId      : currentAccountId,
-      ...(symbolId ? { symbolId: Number(symbolId) } : { symbolName: symbol }),
-      orderType      : Number(type),            // MARKET | LIMIT | STOP
-      tradeSide      : Number(side),            // BUY   | SELL
-      volume         : Number(volume),
-      ...(type !== '1' ? { requestedPrice: Number(price) } : {}),
-      ...(tp !== undefined ? { takeProfitPrice: Number(tp) } : {}),
-      ...(sl !== undefined ? { stopLossPrice: Number(sl) } : {})
-    }
-  };
-
-  console.log('📤 Sending order request:', clientMsgId);
-  console.log('Order payload:', JSON.stringify(orderReq, null, 2));
-
-  ws.send(JSON.stringify(orderReq), err => {
-    if (err) {
-      console.error('❌ WS send error:', err.message);
-      return res.status(500).json({ error: 'ws send error: ' + err.message });
-    }
-
-    const timeout = setTimeout(() => {
-      ws.off('message', listener);
-      console.error('⏱️ Order timeout for:', clientMsgId);
-      res.status(504).json({ error: 'order timeout' });
-    }, 30000); // 30 second timeout
-
-    const listener = data => {
-      let m;
-      try { 
-        m = JSON.parse(data.toString()) 
-      } catch (e) { 
-        console.error('❌ Failed to parse order response:', e.message);
-        return;
-      }
-      
-      if (m.clientMsgId !== clientMsgId) return;   // non nostra risposta
-
-      clearTimeout(timeout);
-      ws.off('message', listener);
-
-      console.log('📥 Order response:', m.payloadType, m.payload);
-
-      if (m.payloadType === 2121) {               // ORDER_NEW_RES
-        return res.json({ 
-          success: true,
-          orderId: m.payload?.orderId,
-          message: 'Order placed successfully'
-        });
-      }
-
-      if (m.payloadType === 2142) {               // ERROR_RES
-        return res.status(400).json({ 
-          error: m.payload?.description || 'Order failed',
-          errorCode: m.payload?.errorCode
-        });
-      }
-
-      res.status(500).json({ 
-        error: 'unexpected reply', 
-        payloadType: m.payloadType,
-        raw: m 
-      });
-    };
-    
-    ws.on('message', listener);
-  });
-});
-
-// Error handling middleware
-app.use((err, req, res, next) => {
-  console.error('❌ Express error:', err);
-  res.status(500).json({ error: 'Internal server error' });
-});
-
-/* ------------------------------------------------------------------ */
-/* GRACEFUL SHUTDOWN                                                  */
-/* ------------------------------------------------------------------ */
-process.on('SIGTERM', () => {
-  console.log('📴 SIGTERM received, shutting down gracefully...');
-  stopHeartbeat();
-  if (ws) ws.close();
-  process.exit(0);
-});
-
-process.on('SIGINT', () => {
-  console.log('📴 SIGINT received, shutting down gracefully...');
-  stopHeartbeat();
-  if (ws) ws.close();
-  process.exit(0);
-});
-
-/* ------------------------------------------------------------------ */
-/* BOOT                                                                */
-/* ------------------------------------------------------------------ */
-async function start() {
+// Trading endpoint
+app.post('/order', async (req, res) => {
   try {
-    console.log('🔄 Initializing token...');
-    await refreshToken();   // primo access-token
-    
-    console.log('🔌 Opening WebSocket...');
-    openSocket();           // WS con reconnessione
-    
-    console.log('🌐 Starting HTTP server...');
-    const server = app.listen(PORT, '0.0.0.0', () => {
-      console.log('✅ cTrader bridge ready on port', PORT);
-    });
+    console.log('📝 Order request received:', req.body);
 
-    server.on('error', (err) => {
-      console.error('❌ Server error:', err);
-      process.exit(1);
+    // Validate WebSocket connection
+    if (!ctraderClient.isReady()) {
+      return res.status(503).json({
+        error: 'cTrader connection not ready',
+        status: 'Please wait for connection to establish'
+      });
+    }
+
+    // Parse and validate order data
+    const { symbol, symbolId, side, volume, type, stopLoss, takeProfit, comment } = req.body;
+
+    // Convert symbol to symbolId if needed
+    let finalSymbolId = symbolId;
+    if (!finalSymbolId && symbol) {
+      finalSymbolId = SYMBOLS[symbol.toUpperCase()];
+      if (!finalSymbolId) {
+        return res.status(400).json({
+          error: 'Invalid symbol',
+          availableSymbols: Object.keys(SYMBOLS)
+        });
+      }
+    }
+
+    if (!finalSymbolId) {
+      return res.status(400).json({
+        error: 'Missing symbolId or symbol',
+        example: { symbolId: 1, side: "1", volume: 100000, type: "1" }
+      });
+    }
+
+    // Validate required fields
+    if (!side || !volume) {
+      return res.status(400).json({
+        error: 'Missing required fields: side, volume',
+        received: req.body
+      });
+    }
+
+    // Prepare order data
+    const orderData = {
+      symbolId: parseInt(finalSymbolId),
+      side: side.toString(),
+      volume: parseInt(volume),
+      type: type || '1', // Default to market order
+      ...(stopLoss && { stopLoss: parseFloat(stopLoss) }),
+      ...(takeProfit && { takeProfit: parseFloat(takeProfit) }),
+      ...(comment && { comment: comment.toString() })
+    };
+
+    // Send order to cTrader
+    const result = await ctraderClient.sendOrder(orderData);
+
+    console.log('✅ Order executed successfully');
+    res.json({
+      success: true,
+      result,
+      timestamp: new Date().toISOString()
     });
 
   } catch (error) {
-    console.error('❌ Startup error:', error.message);
-    console.error('Stack:', error.stack);
+    console.error('❌ Order failed:', error.message);
+    res.status(400).json({
+      error: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+// Error handling
+app.use((error, req, res, next) => {
+  console.error('❌ Server error:', error);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+/* ========================================
+   🚀 APPLICATION STARTUP
+   ======================================== */
+
+async function startup() {
+  try {
+    console.log('\n🚀 Starting cTrader Trading Bridge...');
+    console.log(`📊 Environment: ${CTRADER_ENV}`);
+    console.log(`🏦 Account ID: ${CTRADER_ACCOUNT_ID}`);
+    
+    // Start HTTP server
+    const server = app.listen(PORT, '0.0.0.0', () => {
+      console.log(`🌐 HTTP server listening on port ${PORT}`);
+    });
+
+    // Connect to cTrader
+    await ctraderClient.connect();
+
+    // Graceful shutdown
+    const shutdown = () => {
+      console.log('\n⏹️  Shutting down gracefully...');
+      
+      server.close(() => {
+        ctraderClient.disconnect();
+        tokenManager.destroy();
+        process.exit(0);
+      });
+    };
+
+    process.on('SIGTERM', shutdown);
+    process.on('SIGINT', shutdown);
+
+    console.log('✅ cTrader Trading Bridge is ready!');
+    console.log('\n📋 API Endpoints:');
+    console.log(`   GET  / - Health check`);
+    console.log(`   POST /order - Place trading order`);
+    console.log('\n📖 Order Example:');
+    console.log(`   {
+     "symbolId": 1,     // EURUSD
+     "side": "1",       // BUY (1) or SELL (2) 
+     "volume": 100000,  // 1 lot = 100,000 units
+     "type": "1"        // MARKET (1) or LIMIT (2)
+   }`);
+
+  } catch (error) {
+    console.error('❌ Startup failed:', error);
     process.exit(1);
   }
 }
 
-// Catch unhandled errors
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
-});
-
-process.on('uncaughtException', (error) => {
-  console.error('❌ Uncaught Exception:', error);
-  process.exit(1);
-});
-
-console.log('🚀 Starting application...');
-start();
+// Start the application
+startup();
