@@ -93,8 +93,12 @@ async function refreshToken(delay = 0) {
     const ttl = j.expires_in ?? j.expiresIn ?? 900;
     console.log('✔︎ Token refreshed successfully – expires in', ttl, 's');
 
+    // Limita il timeout per evitare overflow (max 24 ore)
+    const maxTimeout = 24 * 60 * 60 * 1000; // 24 ore in ms
+    const refreshTime = Math.min((ttl - 60) * 1000, maxTimeout);
+    
     // Schedule next refresh
-    setTimeout(refreshToken, (ttl - 60 + (Math.random()*10 - 5))*1000);
+    setTimeout(refreshToken, refreshTime);
     
     return true;
   }
@@ -184,16 +188,26 @@ function openSocket() {
               console.log(`  ${i+1}. AccountID: ${account.ctidTraderAccountId}, Login: ${account.traderLogin}, ${account.isLive ? 'LIVE' : 'DEMO'}, Currency: ${account.depositAssetId}`);
             });
             
-            // Prendiamo il primo account demo disponibile
-            const demoAccount = accountListMsg.payload.ctidTraderAccount.find(acc => !acc.isLive);
-            if (demoAccount) {
-              console.log(`🎯 Using demo account ID: ${demoAccount.ctidTraderAccountId} (Login: ${demoAccount.traderLogin})`);
-              authenticateAccount(demoAccount.ctidTraderAccountId);
+            // Cerchiamo prima l'account FP Markets con login 1056968
+            const targetAccount = accountListMsg.payload.ctidTraderAccount.find(acc => 
+              !acc.isLive && acc.traderLogin === 1056968
+            );
+            
+            if (targetAccount) {
+              console.log(`🎯 Using target demo account ID: ${targetAccount.ctidTraderAccountId} (Login: ${targetAccount.traderLogin})`);
+              authenticateAccount(targetAccount.ctidTraderAccountId);
             } else {
-              console.error('❌ No demo account found - using first available account');
-              const firstAccount = accountListMsg.payload.ctidTraderAccount[0];
-              console.log(`🎯 Using account ID: ${firstAccount.ctidTraderAccountId} (Login: ${firstAccount.traderLogin})`);
-              authenticateAccount(firstAccount.ctidTraderAccountId);
+              // Fallback al primo account demo
+              const demoAccount = accountListMsg.payload.ctidTraderAccount.find(acc => !acc.isLive);
+              if (demoAccount) {
+                console.log(`🎯 Using demo account ID: ${demoAccount.ctidTraderAccountId} (Login: ${demoAccount.traderLogin})`);
+                authenticateAccount(demoAccount.ctidTraderAccountId);
+              } else {
+                console.error('❌ No demo account found - using first available account');
+                const firstAccount = accountListMsg.payload.ctidTraderAccount[0];
+                console.log(`🎯 Using account ID: ${firstAccount.ctidTraderAccountId} (Login: ${firstAccount.traderLogin})`);
+                authenticateAccount(firstAccount.ctidTraderAccountId);
+              }
             }
           } else {
             console.error('❌ No accounts found in response');
