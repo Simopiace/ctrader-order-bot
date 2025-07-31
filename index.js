@@ -1,24 +1,15 @@
-// index.js — mini-bridge HTTP ⇄ WebSocket (cTrader Open-API v2)
-// -------------------------------------------------------------
-// • POST /order   → inoltra ProtoOAOrderNewReq sulla stessa connessione
-// • mantiene il WS vivo, rinnova token & reconnection logic
-//
-// richiede le seguenti env-vars (Fly.io → “Secrets”):
-// CTRADER_CLIENT_ID , CTRADER_CLIENT_SECRET , CTRADER_REFRESH_TOKEN
-// CTRADER_ACCOUNT_ID, CTRADER_ENV=demo|live
-//
-// © 2025 – feel free to reuse
+// index.js — bridge HTTP ⇄ WebSocket (cTrader Open API 2.1)
+// copia/incolla intero file.
 
 import express   from 'express';
 import fetch     from 'node-fetch';
 import WebSocket from 'ws';
 
-/* ─────────────────────────── ENV ────────────────────────── */
 const {
   CTRADER_CLIENT_ID,
   CTRADER_CLIENT_SECRET,
   CTRADER_REFRESH_TOKEN: INITIAL_REFRESH,
-  CTRADER_ACCOUNT_ID,
+  CTRADER_ACCOUNT_ID,           // ← CTID account (int64)
   CTRADER_ENV = 'demo'
 } = process.env;
 
@@ -27,44 +18,17 @@ const WS_HOST =
     ? 'wss://live.ctraderapi.com:5036'
     : 'wss://demo.ctraderapi.com:5036';
 
-/* ────────────────────── runtime state ───────────────────── */
-let ws;                       // WebSocket instance
-let httpToken;                // OAuth token (REST)
-let wsAccessToken;            // OA accessToken (step 2)
+let ws;                        // WebSocket handle
+let accessToken;               // OAuth access token
 let currentRefresh = INITIAL_REFRESH;
+let socketReady = false;       // true dopo ACCOUNT-AUTH OK
+const pending = new Map();     // clientMsgId → {resolve,reject}
 
-/* ────────────────────── util helpers ────────────────────── */
-const delay = ms => new Promise(r => setTimeout(r, ms));
-
-function sendWs(payloadType, payload) {
-  return new Promise((res, rej) => {
-    const msg = { payloadType, payload };
-    ws.send(JSON.stringify(msg), err => err ? rej(err) : res());
-  });
-}
-
-function waitFor(predicate, timeout = 8000) {
-  return new Promise((res, rej) => {
-    const t = setTimeout(
-      () => rej(new Error('WS response timeout')),
-      timeout
-    );
-    const once = buf => {
-      let m;
-      try   { m = JSON.parse(buf.toString()) } catch { return; }
-      if (predicate(m)) {
-        clearTimeout(t);
-        ws.off('message', once);
-        res(m);
-      }
-    };
-    ws.on('message', once);
-  });
-}
-
-/* ─────────────────── REST token (bootstrap) ─────────────── */
-async function refreshHttpToken(backoff = 0) {
-  if (backoff) await delay(backoff);
+/* ------------------------------------------------------------------ */
+/* TOKEN via HTTPS                                                    */
+/* ------------------------------------------------------------------ */
+async function refreshToken (delay = 0) {
+  if (delay) await new Promise(r => setTimeout(r, delay));
   try {
     const res = await fetch('https://openapi.ctrader.com/apps/token', {
       method : 'POST',
@@ -79,106 +43,143 @@ async function refreshHttpToken(backoff = 0) {
 
     if (res.status === 429) {
       const wait = 30_000 + Math.random()*30_000;
-      console.warn('↻ 429 Too Many Requests – retry in', wait/1000, 's');
-      return refreshHttpToken(wait);
+      console.warn('↻ 429 Too Many Requests — retry in', (wait/1000).toFixed(1), 's');
+      return refreshToken(wait);
     }
-    if (!res.ok) throw new Error(await res.text());
+    if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
 
-    const j   = await res.json();
-    httpToken = j.access_token;
+    const j = await res.json();
+    accessToken    = j.access_token;
     currentRefresh = j.refresh_token || currentRefresh;
-
-    const exp = j.expires_in ?? j.expiresIn ?? 900;
-    console.log('✔︎ HTTP token ok – expires in', exp, 's');
-    // renew 60 s before
-    setTimeout(refreshHttpToken, (exp-60)*1000);
-  } catch (e) {
-    console.error('⚠︎ HTTP token refresh:', e.message);
-    setTimeout(refreshHttpToken, 60_000);
+    const expires  = j.expires_in ?? j.expiresIn ?? 900;
+    console.log('✔︎ HTTP token ok – expires in', expires, 's');
+    setTimeout(refreshToken, (expires - 60 + (Math.random()*10 - 5))*1000);
+  }
+  catch (err) {
+    console.error('⚠︎ refresh error', err.message);
+    setTimeout(refreshToken, 60_000 + Math.random()*60_000);
   }
 }
 
-/* ────────────────────── WebSocket flow ──────────────────── */
-async function openSocket() {
+/* ------------------------------------------------------------------ */
+/* WEBSOCKET helpers                                                  */
+/* ------------------------------------------------------------------ */
+function sendWS (msg) {
+  return new Promise((res, rej) => {
+    const id = msg.clientMsgId = msg.clientMsgId || `m_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    pending.set(id, {resolve: res, reject: rej});
+    ws.send(JSON.stringify(msg));
+    // safety-timeout (8 s)
+    setTimeout(() => {
+      if (pending.has(id)) {
+        pending.delete(id);
+        rej(new Error('WS response timeout'));
+      }
+    }, 8_000);
+  });
+}
+
+function openSocket () {
+  socketReady = false;
   ws = new WebSocket(WS_HOST);
 
-  ws.on('open', async () => {
+  ws.on('open', () => {
     console.log('✔︎ WS connected – sending APP-AUTH');
-
-    /* step 1 – APP AUTH */
-    await sendWs(2100, {
+    sendWS({
+      payloadType : 2101,                // ProtoOAApplicationAuthReq
       clientId    : CTRADER_CLIENT_ID,
-      clientSecret: CTRADER_CLIENT_SECRET
+      clientSecret: CTRADER_CLIENT_SECRET,
+      accessToken                         // OPTIONAL – non serve qui
+    })
+    .then(() => {
+      console.log('✓ App-auth OK – sending ACCOUNT-AUTH');
+      return sendWS({
+        payloadType       : 2102,        // ProtoOAAccountAuthReq
+        ctidTraderAccountId: Number(CTRADER_ACCOUNT_ID),
+        accessToken
+      });
+    })
+    .then(() => {
+      socketReady = true;
+      console.log('✓ Account-auth OK — socket pronto');
+    })
+    .catch(err => {
+      console.error('❌ WS auth error', err.message);
+      ws.close();
     });
-    await waitFor(m => m.payloadType === 2101);
-    console.log('✓ App-auth OK – sending REFRESH-TOKEN');
+  });
 
-    /* step 2 – REFRESH -> get wsAccessToken */
-    await sendWs(42, {            // ProtoOARefreshTokenReq
-      refreshToken: currentRefresh,
-      clientId    : CTRADER_CLIENT_ID,
-      clientSecret: CTRADER_CLIENT_SECRET
-    });
-    const r42 = await waitFor(m => m.payloadType === 43);
-    wsAccessToken = r42.payload.accessToken;
-    console.log('✓ Token WS OK – sending ACCOUNT-AUTH');
-
-    /* step 3 – ACCOUNT AUTH */
-    await sendWs(2102, {
-      ctidTraderAccountId: Number(CTRADER_ACCOUNT_ID),
-      accessToken        : wsAccessToken
-    });
-    await waitFor(m => m.payloadType === 2103);
-    console.log('✓ Account-auth OK – socket pronto');
+  ws.on('message', buf => {
+    let m; try { m = JSON.parse(buf.toString()) } catch{/*ignore*/}
+    const {payloadType, clientMsgId} = m || {};
+    if (clientMsgId && pending.has(clientMsgId)) {
+      pending.get(clientMsgId).resolve(m);   // risposta attesa
+      pending.delete(clientMsgId);
+    } else if (payloadType === 40) {         // ProtoOAExecutionEvent
+      console.log('▶︎ Execution event', JSON.stringify(m.payload));
+    } else if (payloadType === 39) {         // ProtoOAErrorRes
+      console.warn('⚠︎ WS error', m.payload?.errorCode, m.payload?.description);
+    }
   });
 
   ws.on('close', () => {
     console.warn('WS closed – reconnecting in 5 s');
     setTimeout(openSocket, 5000);
   });
-  ws.on('error', e => console.error('❌ WS error', e.message));
+  ws.on('error', err => console.error('WS error', err.message));
 }
 
-/* ───────────────────── tiny HTTP API ────────────────────── */
+/* ------------------------------------------------------------------ */
+/* HTTP mini-API (per Make)                                           */
+/* ------------------------------------------------------------------ */
 const app = express();
 app.use(express.json());
 
+// POST /order  { symbolId, side, volume, type, limitPrice?, stopPrice?, tp?, sl? }
 app.post('/order', async (req, res) => {
-  const { symbol, side, volumeLots = 1, type = 'MARKET' } = req.body;
+  if (!socketReady) return res.status(503).json({error:'socket not ready'});
 
-  if (!ws || ws.readyState !== WebSocket.OPEN)
-    return res.status(503).json({ error: 'socket not ready' });
+  const {
+    symbolId,          // INT   (obbligatorio)
+    side,              // "BUY"/"SELL"
+    volume,            // in cent units (es. 100_000 = 1 lot)
+    type = 'MARKET',   // MARKET/LIMIT/STOP/STOP_LIMIT etc.
+    limitPrice,
+    stopPrice,
+    tp, sl,
+    timeInForce
+  } = req.body || {};
+
+  const msg = {
+    payloadType        : 62,                 // ProtoOANewOrderReq
+    ctidTraderAccountId: Number(CTRADER_ACCOUNT_ID),
+    symbolId           : Number(symbolId),
+    orderType          : type,
+    tradeSide          : side,
+    volume             : Number(volume),
+    ...(limitPrice ? {limitPrice} : {}),
+    ...(stopPrice  ? {stopPrice}  : {}),
+    ...(tp         ? {takeProfit : tp} : {}),
+    ...(sl         ? {stopLoss   : sl} : {}),
+    ...(timeInForce? {timeInForce} : {})
+  };
 
   try {
-    const clientMsgId = 'ord_' + Date.now();
-    await sendWs(1100, {                       // ProtoOAOrderNewReq
-      ctidTraderAccountId: Number(CTRADER_ACCOUNT_ID),
-      symbolName         : symbol,
-      tradeSide          : side,               // BUY / SELL
-      orderType          : type,               // MARKET / LIMIT / STOP
-      volume             : volumeLots * 100000, // 1 lot = 100 000 units
-      clientOrderId      : clientMsgId
-    });
-
-    const resp = await waitFor(m =>
-      m.payloadType === 1101 && m.payload.clientOrderId === clientMsgId ||
-      m.payloadType === 1102 && m.payload.clientOrderId === clientMsgId
-    );
-
-    if (resp.payloadType === 1102)        // REJ
-      return res.status(400).json({ error: resp.payload.rejectReason });
-
-    return res.json({ orderId: resp.payload.orderId });
-  } catch (e) {
-    console.error('order err', e.message);
-    return res.status(500).json({ error: 'internal error' });
+    const resp = await sendWS(msg);                      // aspetta ExecutionEvent
+    const exec = resp.payload || {};
+    if (exec.errorCode) throw new Error(exec.errorCode);
+    return res.json({orderId: exec.order?.id, status: exec.executionType});
+  } catch (err) {
+    return res.status(400).json({error: err.message});
   }
 });
 
-/* ────────────────────────── BOOT ────────────────────────── */
-await refreshHttpToken();   // get first OAuth token
-openSocket();               // start / auto-reconnect
+/* ------------------------------------------------------------------ */
+/* BOOT                                                               */
+/* ------------------------------------------------------------------ */
+await refreshToken();    // HTTP token all’avvio
+openSocket();            // WS handshake/reconnect
 
 const PORT = process.env.PORT || 8080;
-app.get('/', (_q,r)=>r.send('cTrader bridge running'));
+app.get('/', (_, r) => r.send('cTrader bridge running'));
 app.listen(PORT, () => console.log('bridge ready on', PORT));
