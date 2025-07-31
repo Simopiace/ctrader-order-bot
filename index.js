@@ -159,7 +159,7 @@ app.post('/order', (req, res) => {
     clientMsgId,
     payloadType : 2120,                       // ORDER_NEW_REQ (JSON)
     payload     : {
-      accountId      : Number(CTRADER_ACCOUNT_ID),
+      ctidTraderAccountId      : Number(CTRADER_ACCOUNT_ID),
       ...(symbolId ? { symbolId: Number(symbolId) } : { symbolName: symbol }),
       orderType      : type,                  // MARKET | LIMIT | STOP
       tradeSide      : side,                  // BUY   | SELL
