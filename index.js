@@ -178,7 +178,7 @@ function openSocket() {
     }
     
     // Log solo messaggi non-heartbeat per ridurre spam
-    if (msg.payloadType !== 2111) { // HEARTBEAT_RES
+    if (msg.payloadType !== 51) { // HEARTBEAT_EVENT
       console.log('▶︎ WS MSG', msg.payloadType, msg.clientMsgId || 'no-id');
     }
   });
@@ -205,7 +205,7 @@ function startHeartbeat() {
     if (ws && ws.readyState === WebSocket.OPEN && isAuthenticated) {
       ws.send(JSON.stringify({
         clientMsgId: 'ping_' + Date.now(),
-        payloadType: 2110, // HEARTBEAT_REQ
+        payloadType: 51, // HEARTBEAT_EVENT (non 2110!)
         payload: {}
       }));
       // console.log('♥ Heartbeat sent'); // Uncomment for debugging
