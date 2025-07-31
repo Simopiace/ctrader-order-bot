@@ -303,18 +303,25 @@ class cTraderClient {
       throw new Error('Not authenticated');
     }
 
+    // Convert numeric values to correct cTrader enums
+    const orderType = orderData.type === '1' ? 'MARKET' : 
+                     orderData.type === '2' ? 'LIMIT' : 
+                     orderData.type === '3' ? 'STOP' : 'MARKET';
+    
+    const tradeSide = orderData.side === '1' ? 'BUY' : 'SELL';
+
     const orderMessage = {
       clientMsgId: `order_${Date.now()}`,
       payloadType: MSG_TYPES.NEW_ORDER_REQ,
       payload: {
         ctidTraderAccountId: parseInt(this.accountId),
-        symbolId: orderData.symbolId,
-        orderType: orderData.type || 'MARKET',
-        tradeSide: orderData.side === '1' ? 'BUY' : 'SELL',
-        volume: orderData.volume,
-        ...(orderData.stopLoss && { stopLoss: orderData.stopLoss }),
-        ...(orderData.takeProfit && { takeProfit: orderData.takeProfit }),
-        ...(orderData.comment && { comment: orderData.comment })
+        symbolId: parseInt(orderData.symbolId),
+        orderType: orderType,
+        tradeSide: tradeSide,
+        volume: parseInt(orderData.volume),
+        ...(orderData.stopLoss && { stopLoss: parseFloat(orderData.stopLoss) }),
+        ...(orderData.takeProfit && { takeProfit: parseFloat(orderData.takeProfit) }),
+        ...(orderData.comment && { comment: orderData.comment.toString() })
       }
     };
 
@@ -562,7 +569,7 @@ async function startup() {
      "symbolId": 1,     // EURUSD
      "side": "1",       // BUY (1) or SELL (2) 
      "volume": 100000,  // 1 lot = 100,000 units
-     "type": "1"        // MARKET (1) or LIMIT (2)
+     "type": "1"        // MARKET (1), LIMIT (2), STOP (3)
    }`);
 
   } catch (error) {
