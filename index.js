@@ -157,41 +157,10 @@ function openSocket() {
     console.log('▶︎ WS AUTH RES', msg);
 
     if (msg.payloadType === 2101) {     // APPLICATION_AUTH_RES
-      console.log('✔︎ App Auth ok – now authenticating account...');
-      
-      // Ora dobbiamo autenticare l'account trading
-      ws.send(JSON.stringify({
-        clientMsgId : 'account_auth_'+Date.now(),
-        payloadType : 2102,              // ACCOUNT_AUTH_REQ
-        payload     : {
-          ctidTraderAccountId: Number(CTRADER_ACCOUNT_ID),
-          accessToken
-        }
-      }));
-      
-      // Aspettiamo la risposta dell'account auth
-      ws.once('message', buf2 => {
-        let accountMsg;
-        try { 
-          accountMsg = JSON.parse(buf2.toString()) 
-        } catch (e) { 
-          console.error('❌ Failed to parse ACCOUNT AUTH response:', e.message);
-          ws.close();
-          return;
-        }
-        
-        console.log('▶︎ WS ACCOUNT AUTH RES', accountMsg);
-        
-        if (accountMsg.payloadType === 2103) {     // ACCOUNT_AUTH_RES
-          console.log('✔︎ Account Auth ok – socket fully ready');
-          isAuthenticated = true;
-          startHeartbeat();
-        } else {
-          console.error('❌ Account Auth failed:', accountMsg.payload?.errorCode, accountMsg.payload?.description);
-          ws.close();
-        }
-      });
-      
+      console.log('✔︎ App Auth ok – SKIPPING account auth for now');
+      console.log('🚨 TEMPORARY: Using app-level connection only');
+      isAuthenticated = true;
+      startHeartbeat();
       return;
     }
     
