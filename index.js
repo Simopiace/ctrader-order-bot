@@ -12,6 +12,7 @@ const {
   CTRADER_CLIENT_ID,
   CTRADER_CLIENT_SECRET,
   CTRADER_REFRESH_TOKEN: INITIAL_REFRESH,
+  CTRADER_ACCESS_TOKEN: INITIAL_ACCESS,
   CTRADER_ACCOUNT_ID,
   CTRADER_ENV = 'demo',   // 'demo' | 'live'
   PORT         = 8080
@@ -23,13 +24,15 @@ console.log('PORT:', PORT);
 console.log('Has CLIENT_ID:', !!CTRADER_CLIENT_ID);
 console.log('Has CLIENT_SECRET:', !!CTRADER_CLIENT_SECRET);
 console.log('Has REFRESH_TOKEN:', !!INITIAL_REFRESH);
+console.log('Has ACCESS_TOKEN:', !!INITIAL_ACCESS);
 console.log('Has ACCOUNT_ID:', !!CTRADER_ACCOUNT_ID);
 
-if (!CTRADER_CLIENT_ID || !CTRADER_CLIENT_SECRET || !INITIAL_REFRESH || !CTRADER_ACCOUNT_ID) {
+if (!CTRADER_CLIENT_ID || !CTRADER_CLIENT_SECRET || (!INITIAL_REFRESH && !INITIAL_ACCESS) || !CTRADER_ACCOUNT_ID) {
   console.error('❌ Variabili d\'ambiente mancanti:');
   console.error('CTRADER_CLIENT_ID:', !!CTRADER_CLIENT_ID);
   console.error('CTRADER_CLIENT_SECRET:', !!CTRADER_CLIENT_SECRET);
   console.error('CTRADER_REFRESH_TOKEN:', !!INITIAL_REFRESH);
+  console.error('CTRADER_ACCESS_TOKEN:', !!INITIAL_ACCESS);
   console.error('CTRADER_ACCOUNT_ID:', !!CTRADER_ACCOUNT_ID);
   process.exit(1);
 }
@@ -47,7 +50,7 @@ console.log('WS_HOST:', WS_HOST);
 /* ------------------------------------------------------------------ */
 /* TOKEN (OAuth2)                                                     */
 /* ------------------------------------------------------------------ */
-let accessToken;
+let accessToken = INITIAL_ACCESS; // Inizializza con access token se disponibile
 let currentRefresh = INITIAL_REFRESH;
 
 async function refreshToken(delay = 0) {
@@ -82,11 +85,18 @@ async function refreshToken(delay = 0) {
     }
 
     const j = await res.json();
+    console.log('Token response:', JSON.stringify(j, null, 2));
+    
+    if (!j.access_token) {
+      throw new Error('No access_token in response: ' + JSON.stringify(j));
+    }
+    
     accessToken    = j.access_token;
     currentRefresh = j.refresh_token || currentRefresh;
 
     const ttl = j.expires_in ?? j.expiresIn ?? 900;
     console.log('✔︎ Token refreshed successfully – expires in', ttl, 's');
+    console.log('Access token set:', !!accessToken);
 
     // Schedule next refresh
     setTimeout(refreshToken, (ttl - 60 + (Math.random()*10 - 5))*1000);
@@ -386,10 +396,18 @@ process.on('SIGINT', () => {
 /* ------------------------------------------------------------------ */
 async function start() {
   try {
-    console.log('🔄 Initializing token...');
-    await refreshToken();   // primo access-token
+    // Se abbiamo già un access token, proviamo a usarlo direttamente
+    if (accessToken) {
+      console.log('✔︎ Using existing access token');
+    } else if (currentRefresh) {
+      console.log('🔄 Initializing token...');
+      await refreshToken();   // primo access-token
+    } else {
+      throw new Error('No access token or refresh token available');
+    }
     
     console.log('🔌 Opening WebSocket...');
+    console.log('Access token available:', !!accessToken);
     openSocket();           // WS con reconnessione
     
     console.log('🌐 Starting HTTP server...');
