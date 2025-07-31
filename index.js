@@ -17,8 +17,8 @@ const {
 /* ──────── host WebSocket ──────── */
 const WS_HOST =
   CTRADER_ENV === 'live'
-    ? 'wss://live.ctraderapi.com:5036/stream?format=json'
-    : 'wss://demo.ctraderapi.com:5036/stream?format=json';
+    ? 'wss://live.ctraderapi.com:5035/stream?format=json'
+    : 'wss://demo.ctraderapi.com:5035/stream?format=json';
 
 /* ──────── map codici payload ──────── */
 const PT = {
