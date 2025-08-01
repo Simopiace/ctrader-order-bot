@@ -18,6 +18,7 @@ const {
   CTRADER_CLIENT_ID,
   CTRADER_CLIENT_SECRET, 
   CTRADER_REFRESH_TOKEN,
+  CTRADER_ACCESS_TOKEN,
   CTRADER_ACCOUNT_ID,
   CTRADER_ENV = 'demo', // 'demo' | 'live'
   PORT = 8080
@@ -66,14 +67,25 @@ class SmartTokenManager {
     this.maxRetries = 3;
     this.retryCount = 0;
     this.pendingRefreshToken = null; // Store new token temporarily
+    
+    // Start with the provided access token if available
+    if (process.env.CTRADER_ACCESS_TOKEN) {
+      this.accessToken = process.env.CTRADER_ACCESS_TOKEN;
+      // Assume token is valid for 30 days from now
+      this.expiryTime = Date.now() + (30 * 24 * 60 * 60 * 1000);
+      console.log('✅ Using provided access token (valid for ~30 days)');
+    }
   }
 
   async getValidToken() {
-    // If token is valid for at least 1 hour, use it
+    // IMPORTANT: Check if we have a valid token FIRST
     if (this.accessToken && Date.now() < this.expiryTime - 3600000) {
       return this.accessToken;
     }
 
+    // Only refresh if token is actually expired or missing
+    console.log('⚠️  Token expired or missing, need to refresh');
+    
     // If already refreshing, wait for it
     if (this.isRefreshing) {
       console.log('⏳ Token refresh in progress, waiting...');
@@ -627,6 +639,7 @@ function validateConfig() {
     'CTRADER_CLIENT_ID',
     'CTRADER_CLIENT_SECRET', 
     'CTRADER_REFRESH_TOKEN',
+    'CTRADER_ACCESS_TOKEN',
     'CTRADER_ACCOUNT_ID'
   ];
 
