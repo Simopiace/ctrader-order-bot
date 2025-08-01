@@ -78,9 +78,14 @@ class SmartTokenManager {
     if (this.isRefreshing) {
       console.log('⏳ Token refresh in progress, waiting...');
       return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          reject(new Error('Token refresh timeout'));
+        }, 30000); // 30 second timeout
+        
         const checkInterval = setInterval(() => {
           if (!this.isRefreshing) {
             clearInterval(checkInterval);
+            clearTimeout(timeout);
             if (this.accessToken) {
               resolve(this.accessToken);
             } else {
@@ -155,7 +160,9 @@ class SmartTokenManager {
       console.log(`⏰ Token expires in ${Math.round(expiresIn/86400)} days`);
       
       // Schedule next refresh 3 days before expiry (27 days from now)
-      this.scheduleNextRefresh(expiresIn - 259200); // 3 days buffer
+      // But use 24 days due to Node.js timeout limitations
+      const refreshInSeconds = Math.min(expiresIn - 259200, 24 * 86400); // Max 24 days
+      this.scheduleNextRefresh(refreshInSeconds);
       
       this.retryCount = 0; // Reset retry counter on success
       return this.accessToken;
@@ -255,18 +262,27 @@ class SmartTokenManager {
       clearTimeout(this.refreshTimeout);
     }
 
-    // Ensure sane timeout values (min 1 hour, max 27 days)
-    const minTimeout = 3600; // 1 hour
-    const maxTimeout = 27 * 24 * 3600; // 27 days
-    const safeTimeout = Math.min(Math.max(seconds, minTimeout), maxTimeout);
+    // Fix for Node.js 32-bit timeout limitation
+    // Maximum setTimeout value is 2147483647 (about 24.8 days)
+    const MAX_TIMEOUT_MS = 2147483647; // ~24.8 days in milliseconds
     
-    console.log(`⏰ Next token refresh in ${Math.round(safeTimeout/86400)} days`);
+    // Convert seconds to milliseconds
+    let timeoutMs = seconds * 1000;
+    
+    // If timeout is too large, set it to maximum safe value (24 days)
+    if (timeoutMs > MAX_TIMEOUT_MS) {
+      console.log(`⚠️  Timeout too large (${Math.round(seconds/86400)} days), setting to 24 days`);
+      timeoutMs = MAX_TIMEOUT_MS;
+    }
+    
+    const timeoutDays = Math.round(timeoutMs / 86400000);
+    console.log(`⏰ Next token refresh scheduled in ${timeoutDays} days`);
     
     this.refreshTimeout = setTimeout(() => {
       this.refreshAccessToken().catch(error => {
         console.error('🚨 Scheduled token refresh failed:', error.message);
       });
-    }, safeTimeout * 1000);
+    }, timeoutMs);
   }
 
   destroy() {
