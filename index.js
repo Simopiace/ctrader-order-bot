@@ -1,4 +1,4 @@
-// 🚀 cTrader Trading Bridge - Production Ready Version
+cTrader Trading Bridge - 100% Autonomous Version// 🚀 cTrader Trading Bridge - Production Ready Version
 // Telegram → Make.com → This Bridge → cTrader
 // Node.js 18+ with "type": "module" in package.json
 
@@ -66,14 +66,26 @@ class SmartTokenManager {
     this.isRefreshing = false;
     this.maxRetries = 3;
     this.retryCount = 0;
-    this.pendingRefreshToken = null; // Store new token temporarily
+    this.pendingRefreshToken = null;
     
-    // Start with the provided access token if available
-    if (process.env.CTRADER_ACCESS_TOKEN) {
-      this.accessToken = process.env.CTRADER_ACCESS_TOKEN;
-      // Assume token is valid for 30 days from now
-      this.expiryTime = Date.now() + (30 * 24 * 60 * 60 * 1000);
-      console.log('✅ Using provided access token (valid for ~30 days)');
+    // Check if we have a saved token from previous session
+    this.loadSavedToken();
+  }
+  
+  async loadSavedToken() {
+    try {
+      const fs = await import('fs/promises');
+      const data = await fs.readFile('/tmp/refresh_token.json', 'utf8');
+      const tokenData = JSON.parse(data);
+      
+      if (tokenData.refreshToken && tokenData.refreshToken !== this.refreshToken) {
+        console.log('📝 Found saved refresh token from previous session');
+        this.refreshToken = tokenData.refreshToken;
+        // Update env for current session
+        process.env.CTRADER_REFRESH_TOKEN = tokenData.refreshToken;
+      }
+    } catch (e) {
+      // File doesn't exist or can't read, that's OK
     }
   }
 
@@ -232,14 +244,28 @@ class SmartTokenManager {
     try {
       console.log('🔄 Auto-updating Fly.io refresh token secret...');
       
-      // Fly.io API endpoint
-      const flyApiUrl = `https://api.fly.io/v1/apps/${process.env.FLY_APP_NAME}/secrets`;
+      // Use Fly.io Machines API v2
+      const appName = process.env.FLY_APP_NAME || 'ctrader-order-bot';
+      const flyApiUrl = `https://api.machines.dev/v1/apps/${appName}/secrets`;
       
       // Need FLY_API_TOKEN to update secrets
       if (!process.env.FLY_API_TOKEN) {
         console.warn('⚠️  FLY_API_TOKEN not set, cannot auto-update refresh token');
-        console.log('📝 Set it with: fly secrets set FLY_API_TOKEN=$(fly auth token)');
-        console.log(`📝 Manual update required: fly secrets set CTRADER_REFRESH_TOKEN="${newRefreshToken.substring(0, 20)}..."`);
+        console.log('📝 To enable auto-update: fly secrets set FLY_API_TOKEN=$(fly auth token)');
+        
+        // FALLBACK: Save to persistent file if possible
+        try {
+          const fs = await import('fs/promises');
+          const tokenData = {
+            refreshToken: newRefreshToken,
+            updatedAt: new Date().toISOString()
+          };
+          await fs.writeFile('/tmp/refresh_token.json', JSON.stringify(tokenData));
+          console.log('📝 Token saved to /tmp/refresh_token.json');
+        } catch (e) {
+          console.log('⚠️  Could not save token to file');
+        }
+        
         return;
       }
 
@@ -250,22 +276,52 @@ class SmartTokenManager {
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
-          secrets: {
-            CTRADER_REFRESH_TOKEN: newRefreshToken
-          }
+          secrets: [
+            {
+              name: 'CTRADER_REFRESH_TOKEN',
+              value: newRefreshToken
+            }
+          ]
         })
       });
 
       if (response.ok) {
         console.log('✅ Fly.io refresh token secret updated automatically!');
-        console.log('🔄 App will restart to apply new secret...');
+        
+        // The app will auto-restart with new token
+        console.log('🔄 App will restart automatically with new token...');
+        
+        // Update environment variable for current session
+        process.env.CTRADER_REFRESH_TOKEN = newRefreshToken;
+        
       } else {
-        console.error('❌ Failed to update Fly.io secret:', await response.text());
-        console.log(`📝 Manual update required: fly secrets set CTRADER_REFRESH_TOKEN="${newRefreshToken.substring(0, 20)}..."`);
+        const errorText = await response.text();
+        console.error('❌ Fly API response:', response.status, errorText);
+        
+        // Try alternative API endpoint
+        const altUrl = `https://api.fly.io/v1/apps/${appName}/secrets`;
+        console.log('🔄 Trying alternative API endpoint...');
+        
+        const altResponse = await fetch(altUrl, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${process.env.FLY_API_TOKEN}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            CTRADER_REFRESH_TOKEN: newRefreshToken
+          })
+        });
+        
+        if (altResponse.ok) {
+          console.log('✅ Secret updated via alternative API!');
+          process.env.CTRADER_REFRESH_TOKEN = newRefreshToken;
+        } else {
+          console.error('❌ Both API endpoints failed');
+        }
       }
     } catch (error) {
       console.error('❌ Error updating Fly.io secret:', error);
-      console.log(`📝 Manual update required: fly secrets set CTRADER_REFRESH_TOKEN="${newRefreshToken.substring(0, 20)}..."`);
     }
   }
 
@@ -397,13 +453,12 @@ class RobustcTraderClient {
     } catch (error) {
       console.error('❌ Application auth failed:', error);
       
-      // If token is invalid, don't reconnect infinitely
-      if (error.message.includes('ACCESS_DENIED')) {
+      // If token is invalid, we'll get a proper error from cTrader
+      // Don't stop reconnections yet
+      if (error.message.includes('ACCESS_DENIED') || error.message.includes('INVALID_GRANT')) {
         console.error('💀 Invalid credentials, stopping reconnections');
         return;
       }
-      
-      this.scheduleReconnect();
     }
   }
 
@@ -447,6 +502,20 @@ class RobustcTraderClient {
       case MSG_TYPES.ACCOUNT_AUTH_RES:
         if (message.payload?.errorCode) {
           console.error('❌ Account auth failed:', message.payload.description);
+          
+          // If token is invalid, try to refresh it
+          if (message.payload.errorCode === 'CH_ACCESS_TOKEN_INVALID') {
+            console.log('🔄 Access token invalid, refreshing...');
+            this.tokenManager.refreshAccessToken()
+              .then(() => {
+                console.log('✅ Token refreshed, reconnecting...');
+                this.ws.close(1000, 'Token refreshed');
+                this.scheduleReconnect();
+              })
+              .catch(err => {
+                console.error('❌ Token refresh failed:', err);
+              });
+          }
         } else {
           console.log('✅ Account authenticated - starting heartbeat...');
           this.isAuthenticated = true;
@@ -460,6 +529,20 @@ class RobustcTraderClient {
 
       case MSG_TYPES.ERROR_RES:
         this.handleError(message);
+        
+        // If we get an invalid token error, try to refresh
+        if (message.payload?.errorCode === 'CH_ACCESS_TOKEN_INVALID') {
+          console.log('🔄 Access token invalid, refreshing...');
+          this.tokenManager.refreshAccessToken()
+            .then(() => {
+              console.log('✅ Token refreshed, reconnecting...');
+              this.ws.close(1000, 'Token refreshed');
+              this.scheduleReconnect();
+            })
+            .catch(err => {
+              console.error('❌ Token refresh failed:', err);
+            });
+        }
         break;
 
       case MSG_TYPES.HEARTBEAT_EVENT:
@@ -639,7 +722,6 @@ function validateConfig() {
     'CTRADER_CLIENT_ID',
     'CTRADER_CLIENT_SECRET', 
     'CTRADER_REFRESH_TOKEN',
-    'CTRADER_ACCESS_TOKEN',
     'CTRADER_ACCOUNT_ID'
   ];
 
@@ -648,6 +730,12 @@ function validateConfig() {
   if (missing.length > 0) {
     console.error('❌ Missing required environment variables:', missing);
     process.exit(1);
+  }
+
+  // FLY_API_TOKEN is optional but recommended for full automation
+  if (!process.env.FLY_API_TOKEN) {
+    console.warn('⚠️  FLY_API_TOKEN not set - token updates will be semi-automatic');
+    console.log('💡 For 100% automation: fly secrets set FLY_API_TOKEN=$(fly auth token)');
   }
 
   console.log('✅ Configuration validated');
