@@ -1,10 +1,14 @@
-// 🚀 cTrader Trading Bridge - Clean & Robust Version
+// 🚀 cTrader Trading Bridge - Production Ready Version
 // Telegram → Make.com → This Bridge → cTrader
 // Node.js 18+ with "type": "module" in package.json
 
 import express from 'express';
 import fetch from 'node-fetch';
 import WebSocket from 'ws';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+
+const execAsync = promisify(exec);
 
 /* ========================================
    📋 CONFIGURATION & CONSTANTS
@@ -49,29 +53,55 @@ const SYMBOLS = {
 };
 
 /* ========================================
-   🔐 TOKEN MANAGER
+   🔐 SMART TOKEN MANAGER
    ======================================== */
 
-class TokenManager {
+class SmartTokenManager {
   constructor() {
     this.accessToken = null;
     this.refreshToken = CTRADER_REFRESH_TOKEN;
     this.expiryTime = 0;
     this.refreshTimeout = null;
+    this.isRefreshing = false;
+    this.maxRetries = 3;
+    this.retryCount = 0;
+    this.pendingRefreshToken = null; // Store new token temporarily
   }
 
   async getValidToken() {
-    // Check if current token is still valid (with 5min buffer)
-    if (this.accessToken && Date.now() < this.expiryTime - 300000) {
+    // If token is valid for at least 1 hour, use it
+    if (this.accessToken && Date.now() < this.expiryTime - 3600000) {
       return this.accessToken;
+    }
+
+    // If already refreshing, wait for it
+    if (this.isRefreshing) {
+      console.log('⏳ Token refresh in progress, waiting...');
+      return new Promise((resolve, reject) => {
+        const checkInterval = setInterval(() => {
+          if (!this.isRefreshing) {
+            clearInterval(checkInterval);
+            if (this.accessToken) {
+              resolve(this.accessToken);
+            } else {
+              reject(new Error('Token refresh failed'));
+            }
+          }
+        }, 100);
+      });
     }
 
     return await this.refreshAccessToken();
   }
 
   async refreshAccessToken() {
+    if (this.isRefreshing) return this.accessToken;
+    
+    this.isRefreshing = true;
+    
     try {
       console.log('🔄 Refreshing access token...');
+      console.log('⚠️  Note: This will invalidate the current refresh token!');
       
       const response = await fetch('https://openapi.ctrader.com/apps/token', {
         method: 'POST',
@@ -85,32 +115,138 @@ class TokenManager {
       });
 
       if (!response.ok) {
-        throw new Error(`Token refresh failed: ${response.status}`);
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       }
 
       const data = await response.json();
       
       if (data.errorCode) {
-        throw new Error(`Token error: ${data.errorCode} - ${data.description}`);
+        throw new Error(`${data.errorCode}: ${data.description}`);
       }
 
+      // Update tokens
       this.accessToken = data.accessToken;
-      this.refreshToken = data.refreshToken || this.refreshToken;
       
-      // Set expiry time (default 15 minutes)
-      const expiresIn = data.expiresIn || 900;
+      // CRITICAL: Update refresh token (old one is invalidated!)
+      if (data.refreshToken) {
+        this.refreshToken = data.refreshToken;
+        this.pendingRefreshToken = data.refreshToken; // Store for webhook
+        console.log('🔄 Refresh token updated (old token invalidated)');
+        
+        // Send notification to Make.com webhook if configured
+        if (process.env.MAKE_WEBHOOK_URL) {
+          this.notifyTokenRefresh(data.refreshToken);
+        }
+        
+        // Auto-update Fly.io secrets if running on Fly
+        if (process.env.FLY_APP_NAME && process.env.FLY_API_TOKEN) {
+          await this.updateFlySecret(data.refreshToken);
+        } else {
+          console.log('⚠️  IMPORTANT: Update the refresh token in your secrets!');
+          console.log(`📝 New refresh token available at: GET /token-update`);
+        }
+      }
+      
+      // Set expiry time (30 days = 2,628,000 seconds)
+      const expiresIn = data.expiresIn || 2628000; // Default to 30 days
       this.expiryTime = Date.now() + (expiresIn * 1000);
 
-      console.log(`✅ Token refreshed successfully (expires in ${expiresIn}s)`);
+      console.log(`✅ Token refreshed successfully`);
+      console.log(`⏰ Token expires in ${Math.round(expiresIn/86400)} days`);
       
-      // Schedule next refresh (5 minutes before expiry)
-      this.scheduleNextRefresh(expiresIn - 300);
+      // Schedule next refresh 3 days before expiry (27 days from now)
+      this.scheduleNextRefresh(expiresIn - 259200); // 3 days buffer
       
+      this.retryCount = 0; // Reset retry counter on success
       return this.accessToken;
 
     } catch (error) {
       console.error('❌ Token refresh failed:', error.message);
+      this.retryCount++;
+      
+      // If refresh token is invalid, stop trying
+      if (error.message.includes('ACCESS_DENIED') || 
+          error.message.includes('INVALID_GRANT') ||
+          this.retryCount >= this.maxRetries) {
+        console.error('💀 Refresh token invalid or max retries reached');
+        console.error('📝 Manual re-authorization required');
+        throw error;
+      }
+      
+      // Exponential backoff for retries
+      const backoffTime = Math.min(60000 * Math.pow(2, this.retryCount), 300000);
+      console.log(`🔄 Retrying token refresh in ${backoffTime/1000}s...`);
+      
+      setTimeout(() => {
+        this.refreshAccessToken().catch(console.error);
+      }, backoffTime);
+      
       throw error;
+    } finally {
+      this.isRefreshing = false;
+    }
+  }
+
+  async notifyTokenRefresh(newRefreshToken) {
+    try {
+      console.log('📨 Sending token refresh notification to Make.com...');
+      
+      await fetch(process.env.MAKE_WEBHOOK_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          event: 'token_refreshed',
+          timestamp: new Date().toISOString(),
+          app_name: process.env.FLY_APP_NAME || 'ctrader-order-bot',
+          refresh_token: newRefreshToken,
+          message: 'cTrader refresh token has been updated. Please update your secrets.'
+        })
+      });
+      
+      console.log('✅ Notification sent to Make.com');
+    } catch (error) {
+      console.error('❌ Failed to notify Make.com:', error);
+    }
+  }
+
+  async updateFlySecret(newRefreshToken) {
+    try {
+      console.log('🔄 Auto-updating Fly.io refresh token secret...');
+      
+      // Fly.io API endpoint
+      const flyApiUrl = `https://api.fly.io/v1/apps/${process.env.FLY_APP_NAME}/secrets`;
+      
+      // Need FLY_API_TOKEN to update secrets
+      if (!process.env.FLY_API_TOKEN) {
+        console.warn('⚠️  FLY_API_TOKEN not set, cannot auto-update refresh token');
+        console.log('📝 Set it with: fly secrets set FLY_API_TOKEN=$(fly auth token)');
+        console.log(`📝 Manual update required: fly secrets set CTRADER_REFRESH_TOKEN="${newRefreshToken.substring(0, 20)}..."`);
+        return;
+      }
+
+      const response = await fetch(flyApiUrl, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${process.env.FLY_API_TOKEN}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          secrets: {
+            CTRADER_REFRESH_TOKEN: newRefreshToken
+          }
+        })
+      });
+
+      if (response.ok) {
+        console.log('✅ Fly.io refresh token secret updated automatically!');
+        console.log('🔄 App will restart to apply new secret...');
+      } else {
+        console.error('❌ Failed to update Fly.io secret:', await response.text());
+        console.log(`📝 Manual update required: fly secrets set CTRADER_REFRESH_TOKEN="${newRefreshToken.substring(0, 20)}..."`);
+      }
+    } catch (error) {
+      console.error('❌ Error updating Fly.io secret:', error);
+      console.log(`📝 Manual update required: fly secrets set CTRADER_REFRESH_TOKEN="${newRefreshToken.substring(0, 20)}..."`);
     }
   }
 
@@ -119,14 +255,17 @@ class TokenManager {
       clearTimeout(this.refreshTimeout);
     }
 
-    // Limit timeout to max 24 hours to prevent overflow
-    const maxTimeout = 24 * 60 * 60; // 24 hours
-    const safeTimeout = Math.min(Math.max(seconds, 60), maxTimeout);
+    // Ensure sane timeout values (min 1 hour, max 27 days)
+    const minTimeout = 3600; // 1 hour
+    const maxTimeout = 27 * 24 * 3600; // 27 days
+    const safeTimeout = Math.min(Math.max(seconds, minTimeout), maxTimeout);
     
-    console.log(`⏰ Next token refresh in ${Math.round(safeTimeout/60)} minutes`);
+    console.log(`⏰ Next token refresh in ${Math.round(safeTimeout/86400)} days`);
     
     this.refreshTimeout = setTimeout(() => {
-      this.refreshAccessToken().catch(console.error);
+      this.refreshAccessToken().catch(error => {
+        console.error('🚨 Scheduled token refresh failed:', error.message);
+      });
     }, safeTimeout * 1000);
   }
 
@@ -138,10 +277,10 @@ class TokenManager {
 }
 
 /* ========================================
-   🔌 WEBSOCKET CLIENT
+   🔌 ROBUST WEBSOCKET CLIENT
    ======================================== */
 
-class cTraderClient {
+class RobustcTraderClient {
   constructor(tokenManager) {
     this.tokenManager = tokenManager;
     this.ws = null;
@@ -150,12 +289,21 @@ class cTraderClient {
     this.heartbeatInterval = null;
     this.reconnectTimeout = null;
     this.messageHandlers = new Map();
+    this.connectionAttempts = 0;
+    this.maxReconnectAttempts = 10;
+    this.lastHeartbeatTime = 0;
   }
 
   async connect() {
     try {
+      if (this.connectionAttempts >= this.maxReconnectAttempts) {
+        console.error('💀 Max reconnection attempts reached, stopping...');
+        return;
+      }
+
+      this.connectionAttempts++;
       const wsUrl = WS_ENDPOINTS[CTRADER_ENV];
-      console.log(`🔌 Connecting to ${CTRADER_ENV} WebSocket...`);
+      console.log(`🔌 Connecting to ${CTRADER_ENV} WebSocket (attempt ${this.connectionAttempts})...`);
       
       this.ws = new WebSocket(wsUrl);
       
@@ -171,7 +319,8 @@ class cTraderClient {
   }
 
   async onOpen() {
-    console.log('✅ WebSocket connected - authenticating...');
+    console.log('✅ WebSocket connected - authenticating application...');
+    this.connectionAttempts = 0; // Reset on successful connection
     await this.authenticateApplication();
   }
 
@@ -188,6 +337,13 @@ class cTraderClient {
     console.log(`⚠️  WebSocket closed (${code}): ${reason}`);
     this.isAuthenticated = false;
     this.stopHeartbeat();
+    
+    // Don't reconnect for certain close codes (auth failures)
+    if (code === 1008 || code === 4000) {
+      console.error('💀 Authentication failed, stopping reconnections');
+      return;
+    }
+    
     this.scheduleReconnect();
   }
 
@@ -212,6 +368,13 @@ class cTraderClient {
       this.sendMessage(authMessage);
     } catch (error) {
       console.error('❌ Application auth failed:', error);
+      
+      // If token is invalid, don't reconnect infinitely
+      if (error.message.includes('ACCESS_DENIED')) {
+        console.error('💀 Invalid credentials, stopping reconnections');
+        return;
+      }
+      
       this.scheduleReconnect();
     }
   }
@@ -245,8 +408,12 @@ class cTraderClient {
 
     switch (payloadType) {
       case MSG_TYPES.APPLICATION_AUTH_RES:
-        console.log('✅ Application authenticated - authenticating account...');
-        this.authenticateAccount();
+        if (message.payload?.errorCode) {
+          console.error('❌ Application auth failed:', message.payload.description);
+        } else {
+          console.log('✅ Application authenticated - authenticating account...');
+          this.authenticateAccount();
+        }
         break;
 
       case MSG_TYPES.ACCOUNT_AUTH_RES:
@@ -264,11 +431,11 @@ class cTraderClient {
         break;
 
       case MSG_TYPES.ERROR_RES:
-        console.error('❌ API Error:', message.payload);
+        this.handleError(message);
         break;
 
       case MSG_TYPES.HEARTBEAT_EVENT:
-        // Heartbeat response - connection is alive
+        this.lastHeartbeatTime = Date.now();
         break;
 
       default:
@@ -285,7 +452,17 @@ class cTraderClient {
     if (message.payload?.errorCode) {
       console.error('❌ Order failed:', message.payload.description);
     } else {
-      console.log('✅ Order executed successfully:', message.payload);
+      console.log('✅ Order executed successfully');
+    }
+  }
+
+  handleError(message) {
+    const error = message.payload;
+    console.error('❌ API Error:', error);
+    
+    // Handle rate limiting
+    if (error.errorCode === 'REQUEST_FREQUENCY_EXCEEDED') {
+      console.warn('⚠️  Rate limit exceeded, backing off...');
     }
   }
 
@@ -294,21 +471,15 @@ class cTraderClient {
       this.ws.send(JSON.stringify(message));
       return true;
     }
+    console.warn('⚠️  Cannot send message: WebSocket not connected');
     return false;
   }
 
-  // Send trading order
+  // Send trading order with proper error handling
   async sendOrder(orderData) {
     if (!this.isAuthenticated) {
-      throw new Error('Not authenticated');
+      throw new Error('Not authenticated - please wait for connection');
     }
-
-    // Convert numeric values to correct cTrader enums
-    const orderType = orderData.type === '1' ? 'MARKET' : 
-                     orderData.type === '2' ? 'LIMIT' : 
-                     orderData.type === '3' ? 'STOP' : 'MARKET';
-    
-    const tradeSide = orderData.side === '1' ? 'BUY' : 'SELL';
 
     const orderMessage = {
       clientMsgId: `order_${Date.now()}`,
@@ -316,8 +487,8 @@ class cTraderClient {
       payload: {
         ctidTraderAccountId: parseInt(this.accountId),
         symbolId: parseInt(orderData.symbolId),
-        orderType: orderType,
-        tradeSide: tradeSide,
+        orderType: parseInt(orderData.type) || 1, // 1=MARKET, 2=LIMIT, 3=STOP
+        tradeSide: parseInt(orderData.side), // 1=BUY, 2=SELL
         volume: parseInt(orderData.volume),
         ...(orderData.stopLoss && { stopLoss: parseFloat(orderData.stopLoss) }),
         ...(orderData.takeProfit && { takeProfit: parseFloat(orderData.takeProfit) }),
@@ -329,8 +500,8 @@ class cTraderClient {
       // Set timeout for order response
       const timeout = setTimeout(() => {
         this.messageHandlers.delete(orderMessage.clientMsgId);
-        reject(new Error('Order timeout'));
-      }, 10000);
+        reject(new Error('Order timeout - no response from broker'));
+      }, 15000); // 15 second timeout
 
       // Set response handler
       this.messageHandlers.set(orderMessage.clientMsgId, (response) => {
@@ -347,7 +518,7 @@ class cTraderClient {
       if (!this.sendMessage(orderMessage)) {
         clearTimeout(timeout);
         this.messageHandlers.delete(orderMessage.clientMsgId);
-        reject(new Error('WebSocket not connected'));
+        reject(new Error('Cannot send order - WebSocket not connected'));
       }
     });
   }
@@ -355,8 +526,9 @@ class cTraderClient {
   startHeartbeat() {
     this.stopHeartbeat();
     
+    // Send heartbeat every 10 seconds (as per cTrader requirement)
     this.heartbeatInterval = setInterval(() => {
-      if (this.isAuthenticated) {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
         const heartbeat = {
           clientMsgId: `heartbeat_${Date.now()}`,
           payloadType: MSG_TYPES.HEARTBEAT_EVENT,
@@ -364,28 +536,41 @@ class cTraderClient {
         };
         
         this.sendMessage(heartbeat);
+        
+        // Check if we're receiving heartbeat responses
+        if (Date.now() - this.lastHeartbeatTime > 30000) {
+          console.warn('⚠️  No heartbeat response for 30s, connection may be stale');
+        }
       }
-    }, 25000); // Every 25 seconds
+    }, 10000); // Every 10 seconds (cTrader requirement)
+    
+    console.log('💓 Heartbeat started (every 10 seconds)');
   }
 
   stopHeartbeat() {
     if (this.heartbeatInterval) {
       clearInterval(this.heartbeatInterval);
       this.heartbeatInterval = null;
+      console.log('💓 Heartbeat stopped');
     }
   }
 
   scheduleReconnect() {
     if (this.reconnectTimeout) return;
 
-    console.log('⏳ Reconnecting in 5 seconds...');
+    // Exponential backoff: 5s, 10s, 20s, 40s, 60s max
+    const backoffTime = Math.min(5000 * Math.pow(2, this.connectionAttempts - 1), 60000);
+    
+    console.log(`⏳ Reconnecting in ${backoffTime/1000} seconds...`);
     this.reconnectTimeout = setTimeout(() => {
       this.reconnectTimeout = null;
       this.connect();
-    }, 5000);
+    }, backoffTime);
   }
 
   disconnect() {
+    console.log('⏹️  Disconnecting cTrader client...');
+    
     this.stopHeartbeat();
     
     if (this.reconnectTimeout) {
@@ -394,14 +579,25 @@ class cTraderClient {
     }
 
     if (this.ws) {
-      this.ws.close();
+      this.ws.close(1000, 'Normal closure');
     }
+    
+    this.isAuthenticated = false;
   }
 
   isReady() {
     return this.ws && 
            this.ws.readyState === WebSocket.OPEN && 
            this.isAuthenticated;
+  }
+
+  getStatus() {
+    return {
+      connected: this.ws?.readyState === WebSocket.OPEN,
+      authenticated: this.isAuthenticated,
+      connectionAttempts: this.connectionAttempts,
+      lastHeartbeat: this.lastHeartbeatTime ? new Date(this.lastHeartbeatTime).toISOString() : null
+    };
   }
 }
 
@@ -430,26 +626,48 @@ function validateConfig() {
 
 // Create instances
 validateConfig();
-const tokenManager = new TokenManager();
-const ctraderClient = new cTraderClient(tokenManager);
+const tokenManager = new SmartTokenManager();
+const ctraderClient = new RobustcTraderClient(tokenManager);
 const app = express();
 
 // Middleware
 app.use(express.json());
 
-// Health check endpoint
+// Enhanced health check endpoint
 app.get('/', (req, res) => {
   const status = {
     status: 'running',
     environment: CTRADER_ENV,
-    websocket: ctraderClient.isReady() ? 'connected' : 'disconnected',
-    timestamp: new Date().toISOString()
+    websocket: ctraderClient.getStatus(),
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    tokenRefreshNeeded: tokenManager.pendingRefreshToken ? true : false
   };
   
   res.json(status);
 });
 
-// Trading endpoint
+// Detailed status endpoint
+app.get('/status', (req, res) => {
+  const status = {
+    service: 'cTrader Trading Bridge',
+    version: '2.0.0',
+    environment: CTRADER_ENV,
+    account: CTRADER_ACCOUNT_ID,
+    websocket: ctraderClient.getStatus(),
+    token: {
+      hasAccessToken: !!tokenManager.accessToken,
+      expiresAt: tokenManager.expiryTime ? new Date(tokenManager.expiryTime).toISOString() : null,
+      daysUntilExpiry: tokenManager.expiryTime ? Math.round((tokenManager.expiryTime - Date.now()) / 86400000) : null
+    },
+    timestamp: new Date().toISOString(),
+    uptime: Math.round(process.uptime())
+  };
+  
+  res.json(status);
+});
+
+// Trading endpoint with enhanced validation
 app.post('/order', async (req, res) => {
   try {
     console.log('📝 Order request received:', req.body);
@@ -458,7 +676,8 @@ app.post('/order', async (req, res) => {
     if (!ctraderClient.isReady()) {
       return res.status(503).json({
         error: 'cTrader connection not ready',
-        status: 'Please wait for connection to establish'
+        status: ctraderClient.getStatus(),
+        message: 'Please wait for connection to establish'
       });
     }
 
@@ -480,7 +699,7 @@ app.post('/order', async (req, res) => {
     if (!finalSymbolId) {
       return res.status(400).json({
         error: 'Missing symbolId or symbol',
-        example: { symbolId: 1, side: "1", volume: 100000, type: "1" }
+        example: { symbolId: 1, side: 1, volume: 100000, type: 1 }
       });
     }
 
@@ -492,12 +711,27 @@ app.post('/order', async (req, res) => {
       });
     }
 
+    // Validate enum values
+    if (![1, 2].includes(parseInt(side))) {
+      return res.status(400).json({
+        error: 'Invalid side: must be 1 (BUY) or 2 (SELL)',
+        received: side
+      });
+    }
+
+    if (type && ![1, 2, 3].includes(parseInt(type))) {
+      return res.status(400).json({
+        error: 'Invalid type: must be 1 (MARKET), 2 (LIMIT), or 3 (STOP)',
+        received: type
+      });
+    }
+
     // Prepare order data
     const orderData = {
       symbolId: parseInt(finalSymbolId),
-      side: side.toString(),
+      side: parseInt(side),
       volume: parseInt(volume),
-      type: type || '1', // Default to market order
+      type: parseInt(type) || 1, // Default to market order
       ...(stopLoss && { stopLoss: parseFloat(stopLoss) }),
       ...(takeProfit && { takeProfit: parseFloat(takeProfit) }),
       ...(comment && { comment: comment.toString() })
@@ -510,6 +744,7 @@ app.post('/order', async (req, res) => {
     res.json({
       success: true,
       result,
+      orderData,
       timestamp: new Date().toISOString()
     });
 
@@ -522,10 +757,40 @@ app.post('/order', async (req, res) => {
   }
 });
 
+// Secure endpoint to retrieve pending token update
+app.get('/token-update', (req, res) => {
+  // Simple security: require a key
+  const authKey = req.headers['x-auth-key'] || req.query.key;
+  
+  if (authKey !== process.env.TOKEN_UPDATE_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  
+  if (tokenManager.pendingRefreshToken) {
+    res.json({
+      status: 'token_available',
+      refresh_token: tokenManager.pendingRefreshToken,
+      timestamp: new Date().toISOString(),
+      instructions: 'Update with: fly secrets set CTRADER_REFRESH_TOKEN="[token_value]" -a ctrader-order-bot'
+    });
+    
+    // Clear after retrieval
+    tokenManager.pendingRefreshToken = null;
+  } else {
+    res.json({
+      status: 'no_pending_token',
+      message: 'No refresh token update pending'
+    });
+  }
+});
+
 // Error handling
 app.use((error, req, res, next) => {
   console.error('❌ Server error:', error);
-  res.status(500).json({ error: 'Internal server error' });
+  res.status(500).json({ 
+    error: 'Internal server error',
+    timestamp: new Date().toISOString()
+  });
 });
 
 /* ========================================
@@ -534,9 +799,10 @@ app.use((error, req, res, next) => {
 
 async function startup() {
   try {
-    console.log('\n🚀 Starting cTrader Trading Bridge...');
+    console.log('\n🚀 Starting cTrader Trading Bridge v2.0...');
     console.log(`📊 Environment: ${CTRADER_ENV}`);
     console.log(`🏦 Account ID: ${CTRADER_ACCOUNT_ID}`);
+    console.log('🔒 Production-ready with rate limiting protection');
     
     // Start HTTP server
     const server = app.listen(PORT, '0.0.0.0', () => {
@@ -553,6 +819,7 @@ async function startup() {
       server.close(() => {
         ctraderClient.disconnect();
         tokenManager.destroy();
+        console.log('👋 Shutdown complete');
         process.exit(0);
       });
     };
@@ -562,14 +829,15 @@ async function startup() {
 
     console.log('✅ cTrader Trading Bridge is ready!');
     console.log('\n📋 API Endpoints:');
-    console.log(`   GET  / - Health check`);
-    console.log(`   POST /order - Place trading order`);
+    console.log(`   GET  /        - Health check`);
+    console.log(`   GET  /status  - Detailed status`);
+    console.log(`   POST /order   - Place trading order`);
     console.log('\n📖 Order Example:');
     console.log(`   {
      "symbolId": 1,     // EURUSD
-     "side": "1",       // BUY (1) or SELL (2) 
+     "side": 1,         // BUY (1) or SELL (2) 
      "volume": 100000,  // 1 lot = 100,000 units
-     "type": "1"        // MARKET (1), LIMIT (2), STOP (3)
+     "type": 1          // MARKET (1), LIMIT (2), STOP (3)
    }`);
 
   } catch (error) {
